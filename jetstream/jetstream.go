@@ -921,9 +921,14 @@ func (js *jetStream) OrderedConsumer(ctx context.Context, stream string, cfg Ord
 		namePrefix: namePrefix,
 		doReset:    make(chan struct{}, 1),
 	}
+	// The derived context bounds every background operation (rebuilds,
+	// deferred consumer cleanup). Canceling the caller's context stops the
+	// consumer rather than leaking goroutines.
+	oc.ctx, oc.cancel = context.WithCancel(ctx)
 	consCfg := oc.getConsumerConfig()
 	cons, err := js.CreateOrUpdateConsumer(ctx, stream, *consCfg)
 	if err != nil {
+		oc.cancel()
 		return nil, err
 	}
 	oc.currentConsumer = cons.(*pullConsumer)

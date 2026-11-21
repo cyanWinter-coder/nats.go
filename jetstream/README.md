@@ -389,6 +389,38 @@ standard pull consumers.
 
 > __NOTE__: Ordered consumers are not supported for push consumers.
 
+#### Recovery semantics
+
+Under the hood an ordered consumer is a sequence of short-lived, in-memory
+ephemeral pull consumers (each with `AckNone`), recreated automatically by the
+library whenever the current one can no longer guarantee strict ordering. A
+rebuild is triggered by a missing heartbeat, a reconnect, consumer deletion,
+a missing responder, or a gap in the delivery sequence.
+
+Recovery boundaries and guarantees:
+
+- Every rebuild resumes at the stream sequence immediately after the last
+  message already handed to your handler or iterator. A message already
+  delivered is never delivered twice, and no message that follows a gap is
+  skipped.
+- When a message is missing from the stream itself (for example it was
+  removed with `Stream.DeleteMsg`), the rebuilt consumer transparently skips
+  that sequence hole and continues with the next surviving message.
+- Concurrent failures (such as a lost heartbeat arriving at the same time as
+  a reconnect) are coalesced: only one rebuild runs at a time, and a rebuild
+  that was superseded before it finished cannot overwrite newer consumer
+  state.
+- Rebuilds are bound to the `context.Context` passed to `OrderedConsumer`.
+  Canceling it stops further rebuilds and background reads; the
+  `ConsumeContext`/`MessagesContext` then closes. Messages already buffered
+  client-side when the context is canceled may still be returned before the
+  close.
+- Because messages are not acknowledged (`AckNone`), "delivery" means the
+  library handing the message to your code. If your process dies while
+  handling a message, the next consumer generation starts after the last
+  fully delivered sequence, so an in-flight message can be delivered again in
+  that case.
+
 ```go
 js, _ := jetstream.New(nc)
 

@@ -30,17 +30,32 @@ import (
 
 type (
 	orderedConsumer struct {
-		js                *jetStream
-		cfg               *OrderedConsumerConfig
-		stream            string
-		currentConsumer   *pullConsumer
-		currentSub        *pullSubscription
-		cursor            cursor
-		namePrefix        string
-		serial            int
-		consumerType      consumerType
-		doReset           chan struct{}
-		resetInProgress   atomic.Uint32
+		js              *jetStream
+		cfg             *OrderedConsumerConfig
+		stream          string
+		currentConsumer *pullConsumer
+		currentSub      *pullSubscription
+		cursor          cursor
+		namePrefix      string
+		serial          int
+		consumerType    consumerType
+		// doReset is a size-1 tick channel used by the Consume recovery
+		// goroutine. triggerResetLocked coalesces repeated requests so that a
+		// burst of failures (e.g. missing heartbeat and reconnect at the same
+		// time) schedules at most one recovery: once the channel holds a tick,
+		// every further trigger is a non-blocking no-op until the recovery
+		// loop drains it.
+		doReset chan struct{}
+		// resetMu serializes full consumer rebuilds. Every reset, including
+		// synchronous ones from Fetch/Messages, goes through runRecovery, so
+		// an older rebuild can never finish after and overwrite the state
+		// installed by a newer one.
+		resetMu sync.Mutex
+		// ctx/cancel bound the lifetime of the ordered consumer and every
+		// background operation it starts (rebuilds, deferred cleanup).
+		ctx    context.Context
+		cancel context.CancelFunc
+
 		userErrHandler    ConsumeErrHandler
 		stopAfter         int // StopAfter of Consume or Messages, 0 if not set
 		deliveredMessages int // messages handed to the caller, across resets
@@ -83,21 +98,27 @@ var (
 // See [Consumer.Consume] for more details.
 func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (ConsumeContext, error) {
 	c.Lock()
-	defer c.Unlock()
 	if (c.consumerType == consumerTypeNotSet || c.consumerType == consumerTypeConsume) && c.currentConsumer == nil {
-		err := c.reset()
-		if err != nil {
+		// The constructor always creates the initial consumer, so this only
+		// happens after a failed/canceled recovery. runRecovery takes the lock
+		// itself, so release it across the call.
+		c.Unlock()
+		if err := c.runRecovery(); err != nil {
 			return nil, err
 		}
+		c.Lock()
 	} else if c.consumerType == consumerTypeConsume && c.currentConsumer != nil {
+		c.Unlock()
 		return nil, ErrOrderedConsumerConcurrentRequests
 	}
 	if c.consumerType == consumerTypeFetch {
+		c.Unlock()
 		return nil, ErrOrderConsumerUsedAsFetch
 	}
 	c.consumerType = consumerTypeConsume
 	consumeOpts, err := parseConsumeOpts(true, opts...)
 	if err != nil {
+		c.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrInvalidOption, err)
 	}
 	c.userErrHandler = consumeOpts.ErrHandler
@@ -136,6 +157,10 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 			}
 			dseq := parser.ParseNum(tokens[parser.AckConsumerSeqTokenPos])
 			if dseq != c.cursor.deliverSeq+1 {
+				// A gap in the delivery sequence means messages were lost or
+				// redelivered by the server-side consumer. Rebuild from the
+				// last stream sequence handed to the caller instead of
+				// processing a message out of order.
 				c.Unlock()
 				c.errHandler(serial)(sub, errOrderedSequenceMismatch)
 				return
@@ -158,50 +183,88 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 
 	cc, err := c.currentConsumer.Consume(internalHandler(c.serial), innerOpts()...)
 	if err != nil {
+		c.Unlock()
 		return nil, err
 	}
 	c.currentSub = cc.(*pullSubscription)
+	c.Unlock()
 
-	go func() {
-		for {
-			select {
-			case <-c.doReset:
-				c.Lock()
-				done := c.stopAfter > 0 && c.deliveredMessages >= c.stopAfter
-				c.Unlock()
-				if done {
-					sub.Stop()
-					return
-				}
-				if err := c.reset(); err != nil {
-					if errors.Is(err, errOrderedConsumerClosed) {
-						continue
-					}
-					c.errHandler(c.serial)(c.currentSub, err)
-				}
-				c.Lock()
-				serial := c.serial
-				consumeOpts := innerOpts()
-				c.Unlock()
-				if cc, err := c.currentConsumer.Consume(internalHandler(serial), consumeOpts...); err != nil {
-					c.errHandler(serial)(cc, err)
-				} else {
-					c.Lock()
-					c.currentSub = cc.(*pullSubscription)
-					c.Unlock()
-				}
-			case <-sub.done:
-				s := sub.consumer.currentSub
-				if s != nil {
-					sub.consumer.Lock()
-					s.Stop()
-					sub.consumer.Unlock()
-				}
-				return
-			}
-		}
-	}()
+	go c.consumeRecoveryLoop(sub, internalHandler, innerOpts)
 	return sub, nil
+}
+
+// consumeRecoveryLoop owns all asynchronous rebuilds for a Consume
+// subscription. doReset ticks are coalesced: while one recovery is running,
+// additional failures only set the flag again and trigger a single follow-up
+// rebuild once the current one finishes. Every rebuild goes through
+// runRecovery (which holds resetMu), and the serial is re-read after it
+// returns, so a stale rebuild can never overwrite newer consumer state.
+func (c *orderedConsumer) consumeRecoveryLoop(
+	sub *orderedSubscription,
+	internalHandler func(serial int) func(msg Msg),
+	innerOpts func() []PullConsumeOpt,
+) {
+	for {
+		select {
+		case <-c.ctx.Done():
+			// Lifecycle canceled: stop the active subscription so Closed()
+			// fires and no further deliveries or background reads happen.
+			sub.Stop()
+			return
+		case <-sub.done:
+			s := sub.consumer.currentSub
+			if s != nil {
+				sub.consumer.Lock()
+				s.Stop()
+				sub.consumer.Unlock()
+			}
+			return
+		case <-c.doReset:
+		}
+
+		c.Lock()
+		done := c.stopAfter > 0 && c.deliveredMessages >= c.stopAfter
+		c.Unlock()
+		if done {
+			sub.Stop()
+			return
+		}
+		if err := c.runRecovery(); err != nil {
+			if errors.Is(err, errOrderedConsumerClosed) || errors.Is(err, context.Canceled) {
+				continue
+			}
+			c.Lock()
+			serial := c.serial
+			currentSub := c.currentSub
+			// Re-arm the recovery so the loop retries instead of
+			// re-subscribing to the consumer that just failed.
+			c.triggerResetLocked()
+			c.Unlock()
+			c.errHandler(serial)(currentSub, err)
+			continue
+		}
+		// A failure may have arrived while the rebuild was in progress. If the
+		// tick channel is still armed, run another recovery instead of
+		// re-subscribing to the consumer just rebuilt.
+		if len(c.doReset) > 0 {
+			continue
+		}
+		c.Lock()
+		serial := c.serial
+		consumeOpts := innerOpts()
+		closed := sub.closed.Load() == 1
+		c.Unlock()
+		if closed {
+			return
+		}
+		if cc, err := c.currentConsumer.Consume(internalHandler(serial), consumeOpts...); err != nil {
+			c.errHandler(serial)(cc, err)
+		} else {
+			c.Lock()
+			c.currentSub = cc.(*pullSubscription)
+			c.Unlock()
+		}
+	}
 }
 
 func (c *orderedConsumer) errHandler(serial int) func(cc ConsumeContext, err error) {
@@ -226,13 +289,30 @@ func (c *orderedConsumer) errHandler(serial int) func(cc ConsumeContext, err err
 			errors.Is(err, ErrConsumerDeleted) ||
 			errors.Is(err, errConnected) ||
 			errors.Is(err, nats.ErrNoResponders) {
-			// only reset if serial matches the current consumer serial and there is no reset in progress
-			if serial == c.serial && c.resetInProgress.Load() == 0 {
-				c.resetInProgress.Store(1)
-				c.doReset <- struct{}{}
+			// Only reset if the error comes from the current consumer serial.
+			// triggerReset coalesces concurrent failures (e.g. a missing
+			// heartbeat arriving together with a reconnect) into a single
+			// rebuild.
+			if serial == c.serial {
+				c.triggerResetLocked()
 			}
 		}
 		c.Unlock()
+	}
+}
+
+// triggerResetLocked schedules an asynchronous consumer rebuild for the
+// Consume recovery loop. Repeated calls while a recovery is already queued or
+// in flight are coalesced by the size-1 channel, so concurrent
+// heartbeat/reconnect failures cannot start duplicate rebuilds and error
+// delivery can never block on a full channel. The caller must hold c's lock.
+func (c *orderedConsumer) triggerResetLocked() {
+	if c.ctx.Err() != nil {
+		return
+	}
+	select {
+	case c.doReset <- struct{}{}:
+	default:
 	}
 }
 
@@ -242,20 +322,25 @@ func (c *orderedConsumer) errHandler(serial int) func(cc ConsumeContext, err err
 //
 // See [Consumer.Messages] for more details.
 func (c *orderedConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error) {
+	c.Lock()
 	if (c.consumerType == consumerTypeNotSet || c.consumerType == consumerTypeConsume) && c.currentConsumer == nil {
-		err := c.reset()
-		if err != nil {
+		c.Unlock()
+		if err := c.runRecovery(); err != nil {
 			return nil, err
 		}
+		c.Lock()
 	} else if c.consumerType == consumerTypeConsume && c.currentConsumer != nil {
+		c.Unlock()
 		return nil, ErrOrderedConsumerConcurrentRequests
 	}
 	if c.consumerType == consumerTypeFetch {
+		c.Unlock()
 		return nil, ErrOrderConsumerUsedAsFetch
 	}
 	c.consumerType = consumerTypeConsume
 	consumeOpts, err := parseMessagesOpts(true, opts...)
 	if err != nil {
+		c.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrInvalidOption, err)
 	}
 	// Preserve the resolved heartbeat when creating the pull consumer.
@@ -266,10 +351,13 @@ func (c *orderedConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, er
 	c.stopAfter = max(consumeOpts.StopAfter, 0)
 	c.deliveredMessages = 0
 	c.userErrHandler = consumeOpts.ErrHandler
-	cc, err := c.currentConsumer.Messages(opts...)
+	consumer := c.currentConsumer
+	c.Unlock()
+	cc, err := consumer.Messages(opts...)
 	if err != nil {
 		return nil, err
 	}
+	c.Lock()
 	c.currentSub = cc.(*pullSubscription)
 
 	sub := &orderedSubscription{
@@ -278,6 +366,7 @@ func (c *orderedConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, er
 		done:     make(chan struct{}, 1),
 	}
 	c.subscription = sub
+	c.Unlock()
 
 	return sub, nil
 }
@@ -311,20 +400,31 @@ func (s *orderedSubscription) Next(opts ...NextOpt) (Msg, error) {
 		if err != nil {
 			return nil, err
 		}
+		c := s.consumer
+		c.Lock()
 		serial := serialNumberFromConsumer(tokens[parser.AckConsumerTokenPos])
-		if serial != s.consumer.serial {
+		if serial != c.serial {
+			// Message from a consumer generation already replaced by a
+			// recovery; drop it and read again from the current generation.
+			c.Unlock()
 			continue
 		}
 		dseq := parser.ParseNum(tokens[parser.AckConsumerSeqTokenPos])
-		if dseq != s.consumer.cursor.deliverSeq+1 {
+		if dseq != c.cursor.deliverSeq+1 {
+			// Delivery gap: the current server-side consumer lost or skipped
+			// messages. Rebuild from the last stream sequence returned to the
+			// caller so nothing after the gap is skipped and nothing already
+			// delivered is handed out twice.
+			c.Unlock()
 			if err := s.resetMessages(); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		s.consumer.cursor.deliverSeq = dseq
-		s.consumer.cursor.streamSeq = parser.ParseNum(tokens[parser.AckStreamSeqTokenPos])
-		s.consumer.deliveredMessages++
+		c.cursor.deliverSeq = dseq
+		c.cursor.streamSeq = parser.ParseNum(tokens[parser.AckStreamSeqTokenPos])
+		c.deliveredMessages++
+		c.Unlock()
 		return msg, nil
 	}
 }
@@ -335,20 +435,22 @@ func (s *orderedSubscription) Next(opts ...NextOpt) (Msg, error) {
 // are left to deliver.
 func (s *orderedSubscription) resetMessages() error {
 	c := s.consumer
+	if err := c.runRecovery(); err != nil {
+		if errors.Is(err, errOrderedConsumerClosed) || errors.Is(err, context.Canceled) {
+			return ErrMsgIteratorClosed
+		}
+		return err
+	}
 	opts := s.opts
 	if c.stopAfter > 0 {
+		c.Lock()
 		remaining := c.stopAfter - c.deliveredMessages
+		c.Unlock()
 		if remaining <= 0 {
 			s.Stop()
 			return ErrMsgIteratorClosed
 		}
 		opts = append(slices.Clip(opts), StopAfter(remaining))
-	}
-	if err := c.reset(); err != nil {
-		if errors.Is(err, errOrderedConsumerClosed) {
-			return ErrMsgIteratorClosed
-		}
-		return err
 	}
 	cc, err := c.currentConsumer.Messages(opts...)
 	if err != nil {
@@ -369,6 +471,9 @@ func (s *orderedSubscription) Stop() {
 	if s.consumer.currentSub != nil {
 		s.consumer.currentSub.Stop()
 	}
+	if s.consumer.cancel != nil {
+		s.consumer.cancel()
+	}
 	close(s.done)
 }
 
@@ -380,6 +485,9 @@ func (s *orderedSubscription) Drain() {
 	defer s.consumer.Unlock()
 	if s.consumer.currentSub != nil {
 		s.consumer.currentSub.Drain()
+	}
+	if s.consumer.cancel != nil {
+		s.consumer.cancel()
 	}
 	close(s.done)
 }
@@ -445,6 +553,10 @@ func (c *orderedConsumer) fetch(f func(*pullConsumer) (MessageBatch, error)) (Me
 			c.cursor.streamSeq = c.runningFetch.sseq
 		}
 	}
+	if c.ctx.Err() != nil {
+		c.Unlock()
+		return nil, errOrderedConsumerClosed
+	}
 	c.consumerType = consumerTypeFetch
 	sub := orderedSubscription{
 		consumer: c,
@@ -453,7 +565,7 @@ func (c *orderedConsumer) fetch(f func(*pullConsumer) (MessageBatch, error)) (Me
 	c.subscription = &sub
 	c.fetchInProgress = true
 	c.Unlock()
-	err := c.reset()
+	err := c.runRecovery()
 	var msgs MessageBatch
 	if err == nil {
 		msgs, err = f(c.currentConsumer)
@@ -529,54 +641,111 @@ func serialNumberFromConsumer(name string) int {
 	return serial
 }
 
-func (c *orderedConsumer) reset() error {
+// runRecovery rebuilds the server-side consumer, resuming after the last
+// stream sequence already handed to the caller. It is the single entry point
+// for every rebuild (Consume recovery loop, Messages resets, Fetch), which
+// gives three guarantees:
+//
+//   - rebuilds are serialized by resetMu, so concurrent failures (a missing
+//     heartbeat arriving together with a reconnect) can never run two
+//     rebuilds at once;
+//   - the whole rebuild happens against a snapshot taken under c's lock, and
+//     the new consumer is only published once it is ready, so an older
+//     rebuild cannot finish after and overwrite a newer serial/cursor;
+//   - the rebuild is bound to the consumer's lifecycle context: once the
+//     context is canceled, in-flight consumer creation is aborted and no new
+//     rebuild starts.
+func (c *orderedConsumer) runRecovery() error {
+	c.resetMu.Lock()
+	defer c.resetMu.Unlock()
+
+	if err := c.ctx.Err(); err != nil {
+		return errOrderedConsumerClosed
+	}
+
 	c.Lock()
-	defer c.Unlock()
-	defer c.resetInProgress.Store(0)
-	if c.currentConsumer != nil {
-		c.currentConsumer.Lock()
-		if c.currentSub != nil {
-			c.currentSub.Stop()
-		}
-		consName := c.currentConsumer.CachedInfo().Name
-		c.currentConsumer.Unlock()
+	if c.subscription != nil && c.subscription.closed.Load() == 1 {
+		c.Unlock()
+		return errOrderedConsumerClosed
+	}
+	oldConsumer := c.currentConsumer
+	oldSub := c.currentSub
+	consumerConfig := c.getConsumerConfig()
+	attempts := c.cfg.MaxResetAttempts
+	sub := c.subscription
+	c.Unlock()
+
+	if oldSub != nil {
+		oldSub.Stop()
+	}
+	if oldConsumer != nil {
+		oldConsumer.Lock()
+		consName := oldConsumer.CachedInfo().Name
+		oldConsumer.Unlock()
+		// Best-effort cleanup of the abandoned server-side consumer. It runs
+		// under the lifecycle context so a canceled consumer cannot leave the
+		// goroutine behind, and a timeout keeps a missing server from
+		// blocking the recovery indefinitely.
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+			defer cancel()
 			_ = c.js.DeleteConsumer(ctx, c.stream, consName)
-			cancel()
 		}()
 	}
 
+	// A fresh consumer always restarts its delivery sequence at 1.
+	c.Lock()
 	c.cursor.deliverSeq = 0
-	consumerConfig := c.getConsumerConfig()
+	c.Unlock()
 
-	var err error
-	var cons Consumer
-
-	backoffOpts := backoffOpts{
-		attempts:        c.cfg.MaxResetAttempts,
+	var (
+		err  error
+		cons Consumer
+	)
+	retryOpts := backoffOpts{
+		attempts:        attempts,
 		initialInterval: time.Second,
 		factor:          2,
 		maxInterval:     10 * time.Second,
-		cancel:          c.subscription.done,
+		cancel:          c.ctx.Done(),
 	}
 	err = retryWithBackoff(func(attempt int) (bool, error) {
-		isClosed := c.subscription.closed.Load() == 1
-		if isClosed {
+		if c.ctx.Err() != nil {
 			return false, errOrderedConsumerClosed
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if sub != nil && sub.closed.Load() == 1 {
+			return false, errOrderedConsumerClosed
+		}
+		ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
 		defer cancel()
 		cons, err = c.js.CreateOrUpdateConsumer(ctx, c.stream, *consumerConfig)
 		if err != nil {
 			return true, err
 		}
 		return false, nil
-	}, backoffOpts)
+	}, retryOpts)
 	if err != nil {
+		if c.ctx.Err() != nil || (sub != nil && sub.closed.Load() == 1) {
+			return errOrderedConsumerClosed
+		}
 		return err
 	}
-	c.currentConsumer = cons.(*pullConsumer)
+
+	newConsumer := cons.(*pullConsumer)
+	c.Lock()
+	// Do not publish the rebuild if the consumer was stopped or canceled
+	// while it was in flight: the subscription is dead and its recovery loop
+	// must not pick up a new consumer generation.
+	if c.ctx.Err() != nil || (sub != nil && sub.closed.Load() == 1) {
+		c.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = c.js.DeleteConsumer(ctx, c.stream, newConsumer.CachedInfo().Name)
+		cancel()
+		return errOrderedConsumerClosed
+	}
+	c.currentConsumer = newConsumer
+	c.currentSub = nil
+	c.Unlock()
 	return nil
 }
 
@@ -728,11 +897,18 @@ type backoffOpts struct {
 	// cancel channel
 	// if set, retry will be canceled when this channel is closed
 	cancel <-chan struct{}
+	// cancelErr is returned when the cancel channel is closed. Defaults to
+	// context.Canceled.
+	cancelErr error
 }
 
 func retryWithBackoff(f func(int) (bool, error), opts backoffOpts) error {
 	var err error
 	var shouldContinue bool
+	cancelErr := opts.cancelErr
+	if cancelErr == nil {
+		cancelErr = context.Canceled
+	}
 	// if custom backoff is set, use it instead of other options
 	if len(opts.customBackoff) > 0 {
 		if opts.attempts != 0 {
@@ -741,7 +917,7 @@ func retryWithBackoff(f func(int) (bool, error), opts backoffOpts) error {
 		for i, interval := range opts.customBackoff {
 			select {
 			case <-opts.cancel:
-				return nil
+				return cancelErr
 			case <-time.After(interval):
 			}
 			shouldContinue, err = f(i)
@@ -768,7 +944,11 @@ func retryWithBackoff(f func(int) (bool, error), opts backoffOpts) error {
 	interval := opts.initialInterval
 	for i := 0; ; i++ {
 		if i == 0 && opts.disableInitialExecution {
-			time.Sleep(interval)
+			select {
+			case <-opts.cancel:
+				return cancelErr
+			case <-time.After(interval):
+			}
 			continue
 		}
 		shouldContinue, err = f(i)
@@ -780,7 +960,7 @@ func retryWithBackoff(f func(int) (bool, error), opts backoffOpts) error {
 		}
 		select {
 		case <-opts.cancel:
-			return nil
+			return cancelErr
 		case <-time.After(interval):
 		}
 		interval = time.Duration(float64(interval) * opts.factor)

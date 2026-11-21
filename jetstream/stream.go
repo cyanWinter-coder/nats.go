@@ -396,9 +396,14 @@ func (s *stream) OrderedConsumer(ctx context.Context, cfg OrderedConsumerConfig)
 		namePrefix: namePrefix,
 		doReset:    make(chan struct{}, 1),
 	}
+	// The derived context bounds every background operation (rebuilds,
+	// deferred consumer cleanup). Canceling the caller's context stops the
+	// consumer rather than leaking goroutines.
+	oc.ctx, oc.cancel = context.WithCancel(ctx)
 	consCfg := oc.getConsumerConfig()
 	cons, err := s.CreateOrUpdateConsumer(ctx, *consCfg)
 	if err != nil {
+		oc.cancel()
 		return nil, err
 	}
 	oc.currentConsumer = cons.(*pullConsumer)
