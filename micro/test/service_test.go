@@ -764,8 +764,8 @@ func TestServiceSlowConsumerOnEndpoint(t *testing.T) {
 		if len(endpoints) != 1 {
 			t.Fatalf("Expected 1 endpoint; got %d", len(endpoints))
 		}
-		if endpoints[0].NumErrors != 1 || endpoints[0].LastError != nats.ErrSlowConsumer.Error() {
-			t.Fatalf("Expected endpoint stats to record 1 error %q; got %d %q", nats.ErrSlowConsumer, endpoints[0].NumErrors, endpoints[0].LastError)
+		if endpoints[0].NumErrors != 1 || endpoints[0].LastError != nats.ErrSlowConsumerMsgsLimit.Error() {
+			t.Fatalf("Expected endpoint stats to record 1 error %q; got %d %q", nats.ErrSlowConsumerMsgsLimit, endpoints[0].NumErrors, endpoints[0].LastError)
 		}
 
 		close(release)

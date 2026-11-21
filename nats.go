@@ -117,6 +117,8 @@ var (
 	ErrBadSubject                    = errors.New("nats: invalid subject")
 	ErrBadQueueName                  = errors.New("nats: invalid queue name")
 	ErrSlowConsumer                  = errors.New("nats: slow consumer, messages dropped")
+	ErrSlowConsumerMsgsLimit         = fmt.Errorf("%w: pending messages limit exceeded", ErrSlowConsumer)
+	ErrSlowConsumerBytesLimit        = fmt.Errorf("%w: pending bytes limit exceeded", ErrSlowConsumer)
 	ErrTimeout                       = errors.New("nats: timeout")
 	ErrBadTimeout                    = errors.New("nats: timeout invalid")
 	ErrAuthorization                 = errors.New("nats: authorization violation")
@@ -791,6 +793,12 @@ type Subscription struct {
 	pMsgsLimit  int
 	pBytesLimit int
 	dropped     int
+
+	// received counts messages accepted into this subscription's pending
+	// queue. blocked counts messages that arrived while the queue was at
+	// its pending limits; each blocked message is also counted in dropped.
+	received uint64
+	blocked  int
 }
 
 // Status represents the state of the connection.
@@ -3963,6 +3971,10 @@ func (nc *Conn) waitForMsgs(s *Subscription) {
 	// Used to account for adjustments to sub.pBytes when we wrap back around.
 	msgLen := -1
 
+	// Set when the loop exits with a popped message that was never delivered
+	// because the subscription was closed first.
+	var undelivered bool
+
 	for {
 		s.mu.Lock()
 		// Do accounting for last msg delivered here so we only lock once
@@ -4014,6 +4026,9 @@ func (nc *Conn) waitForMsgs(s *Subscription) {
 		}
 
 		if closed {
+			// A popped message (if any) will not be delivered: the exit
+			// path accounts for it as dropped.
+			undelivered = m != nil
 			break
 		}
 
@@ -4031,6 +4046,17 @@ func (nc *Conn) waitForMsgs(s *Subscription) {
 	}
 	// Check for barrier messages
 	s.mu.Lock()
+	if msgLen >= 0 {
+		// The message popped in the last iteration was never accounted.
+		// If it was not delivered (the subscription was closed first),
+		// count it as dropped.
+		if undelivered {
+			s.dropped++
+		}
+		s.pMsgs--
+		s.pBytes -= msgLen
+		msgLen = -1
+	}
 	for m := s.pHead; m != nil; m = s.pHead {
 		if m.barrier != nil {
 			s.mu.Unlock()
@@ -4038,9 +4064,16 @@ func (nc *Conn) waitForMsgs(s *Subscription) {
 				m.barrier.f()
 			}
 			s.mu.Lock()
+		} else {
+			// Messages still pending when the subscription is closed are
+			// discarded: count them as dropped so the discard is explicit.
+			s.dropped++
+			s.pMsgs--
+			s.pBytes -= m.pendingSize()
 		}
 		s.pHead = m.next
 	}
+	s.pTail = nil
 	// Now check for pDone
 	done := s.pDone
 	s.mu.Unlock()
@@ -4099,6 +4132,9 @@ func (nc *Conn) processMsg(data []byte) {
 	var ctrlType int
 	var fcReply string
 	var ordSeqs orderedSeqs
+	// scErr is the slow consumer error to report if this message cannot be
+	// queued: it identifies which of the subscription's limits was hit.
+	var scErr error
 
 	if nc.ps.ma.hdr > 0 {
 		hbuf := msgPayload[:nc.ps.ma.hdr]
@@ -4175,6 +4211,12 @@ func (nc *Conn) processMsg(data []byte) {
 			// Check for a Slow Consumer
 			if (sub.pMsgsLimit > 0 && sub.pMsgs > sub.pMsgsLimit) ||
 				(sub.pBytesLimit > 0 && sub.pBytes > sub.pBytesLimit) {
+				sub.blocked++
+				if sub.pMsgsLimit > 0 && sub.pMsgs > sub.pMsgsLimit {
+					scErr = ErrSlowConsumerMsgsLimit
+				} else {
+					scErr = ErrSlowConsumerBytesLimit
+				}
 				goto slowConsumer
 			}
 		} else if jsi != nil {
@@ -4205,6 +4247,10 @@ func (nc *Conn) processMsg(data []byte) {
 					sub.delivered++
 				}
 			default:
+				// The channel is full: the subscription is at its pending
+				// messages limit (the channel capacity).
+				sub.blocked++
+				scErr = ErrSlowConsumerMsgsLimit
 				goto slowConsumer
 			}
 		} else {
@@ -4220,6 +4266,9 @@ func (nc *Conn) processMsg(data []byte) {
 				sub.pTail = m
 			}
 		}
+		// The message was accepted into this subscription's own pending
+		// queue; the read loop never blocks on a slow subscription.
+		sub.received++
 		if jsi != nil {
 			sub.commitOrderedMsg(ordSeqs)
 			// Store the ACK metadata from the message to
@@ -4293,6 +4342,11 @@ slowConsumer:
 	sub.sc = true
 	// Undo stats from above
 	sub.releaseReserved(m)
+	if scErr == nil {
+		// Not a pending-limits drop (e.g. an ordered consumer reset):
+		// report the generic slow consumer error.
+		scErr = ErrSlowConsumer
+	}
 	if sc {
 		sub.changeSubStatus(SubscriptionSlowConsumer)
 		sub.mu.Unlock()
@@ -4302,7 +4356,7 @@ slowConsumer:
 		nc.mu.Lock()
 		nc.err = ErrSlowConsumer
 		if asyncErrorCB := nc.Opts.AsyncErrorCB; asyncErrorCB != nil {
-			nc.ach.push(func() { asyncErrorCB(nc, sub, ErrSlowConsumer) })
+			nc.ach.push(func() { asyncErrorCB(nc, sub, scErr) })
 		}
 		nc.mu.Unlock()
 	} else {
@@ -6221,6 +6275,56 @@ func (s *Subscription) Dropped() (int, error) {
 	return s.dropped, nil
 }
 
+// SubStats is a point-in-time snapshot of a subscription's message flow.
+// Received, Delivered, Dropped and Blocked are cumulative since the
+// subscription was created; PendingMsgs and PendingBytes reflect the
+// current occupancy of the subscription's own pending queue.
+type SubStats struct {
+	// Received is the number of messages accepted into this
+	// subscription's pending queue.
+	Received int64
+	// Delivered is the number of messages handed to the message handler,
+	// to NextMsg, or to the subscriber's channel.
+	Delivered int64
+	// Dropped is the number of messages discarded, either because they
+	// exceeded the pending limits or because they were still pending
+	// when the subscription was closed.
+	Dropped int
+	// Blocked is the number of messages that arrived while the
+	// subscription was at its pending limits. Each blocked message is
+	// also counted in Dropped.
+	Blocked int
+	// PendingMsgs is the number of messages currently pending.
+	// It is not tracked for ChanSubscription.
+	PendingMsgs int
+	// PendingBytes is the size in bytes of the messages currently pending.
+	// It is not tracked for ChanSubscription.
+	PendingBytes int
+}
+
+// Stats returns a snapshot of this subscription's message flow statistics.
+//
+// Unlike Pending, Delivered and Dropped, Stats may be called after the
+// subscription (or the connection) has been closed, which allows inspecting
+// how many messages were received, delivered and discarded, including the
+// pending messages that were dropped on close. A nil subscription returns
+// the zero value.
+func (s *Subscription) Stats() SubStats {
+	var st SubStats
+	if s == nil {
+		return st
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st.Received = int64(s.received)
+	st.Delivered = int64(s.delivered)
+	st.Dropped = s.dropped
+	st.Blocked = s.blocked
+	st.PendingMsgs = s.pMsgs
+	st.PendingBytes = s.pBytes
+	return st
+}
+
 // Respond allows a convenient way to respond to requests in service based subscriptions.
 func (m *Msg) Respond(data []byte) error {
 	if m == nil || m.Sub == nil {
@@ -6391,8 +6495,9 @@ func (nc *Conn) resendSubscriptions() {
 		adjustedMax := uint64(0)
 		s.mu.Lock()
 		// Draining subs are only removed locally once done, so resubscribing
-		// would leave orphaned interest on the server.
-		if s.draining {
+		// would leave orphaned interest on the server. The same applies to
+		// subs that were unsubscribed (closed) after the snapshot was taken.
+		if s.draining || s.closed {
 			s.mu.Unlock()
 			continue
 		}

@@ -1463,8 +1463,13 @@ func TestSubscriptionPendingHeaderBytes(t *testing.T) {
 					}
 					select {
 					case err := <-asyncErrors:
-						if err != nats.ErrSlowConsumer {
+						if !errors.Is(err, nats.ErrSlowConsumer) {
 							t.Fatalf("Expected slow consumer error, got %v", err)
+						}
+						// The bytes limit is the one configured above, so the
+						// error must identify it.
+						if !errors.Is(err, nats.ErrSlowConsumerBytesLimit) {
+							t.Fatalf("Expected bytes limit error, got %v", err)
 						}
 					case <-time.After(5 * time.Second):
 						t.Fatal("Did not receive slow consumer error")
