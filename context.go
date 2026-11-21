@@ -70,6 +70,10 @@ func (nc *Conn) requestWithContext(ctx context.Context, subj string, hdr, data [
 				if nc.IsClosed() {
 					return nil, ErrConnectionClosed
 				}
+				if nc.IsDraining() {
+					// The drain canceled the pending requests.
+					return nil, ErrConnectionDraining
+				}
 				return nil, ErrDisconnected
 			}
 		case <-ctx.Done():

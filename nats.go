@@ -2689,6 +2689,10 @@ func (nc *Conn) waitForExits() {
 // If the connection is already in the process of reconnecting,
 // this call will force an immediate reconnect attempt (bypassing
 // the current reconnect delay).
+//
+// A connection that is draining can not be reconnected: draining is
+// terminal and the connection is about to be closed. ErrConnectionDraining
+// is returned in that case.
 func (nc *Conn) ForceReconnect() error {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
@@ -2704,6 +2708,14 @@ func (nc *Conn) ForceReconnect() error {
 			nc.rqch = nil
 		}
 		return nil
+	}
+
+	// A draining connection is on its way out: reconnecting it would
+	// resurrect a connection that the drain is about to close, and the
+	// in-flight drain would then tear down the new connection. Use
+	// Close() to abort a drain instead.
+	if nc.isDraining() {
+		return ErrConnectionDraining
 	}
 
 	// Clear any queued pongs
@@ -5075,6 +5087,15 @@ func (nc *Conn) respHandler(m *Msg) {
 // Helper to setup and send new request style requests. Return the chan to receive the response.
 func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Msg, string, error) {
 	nc.mu.Lock()
+	// No new requests once the connection is draining publishers: the
+	// response subscription has been torn down, so the request could
+	// never be answered and would sit in respMap until close. Requests
+	// are still allowed while subscriptions drain, since in-flight
+	// message callbacks may need them (for instance JetStream AckSync).
+	if nc.isDrainingPubs() {
+		nc.mu.Unlock()
+		return nil, _EMPTY_, ErrConnectionDraining
+	}
 	// Create new literal Inbox and map to a chan msg.
 	mch := make(chan *Msg, RequestChanLen)
 	respInbox := nc.newRespInbox()
@@ -5087,6 +5108,7 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 		// will be on a wildcard.
 		s, err := nc.subscribeLocked(nc.respSub, _EMPTY_, nc.respHandler, nil, nil, false, nil)
 		if err != nil {
+			delete(nc.respMap, token)
 			nc.mu.Unlock()
 			return nil, token, err
 		}
@@ -5095,6 +5117,11 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 	nc.mu.Unlock()
 
 	if err := nc.publish(subj, respInbox, false, hdr, data); err != nil {
+		// The request was not sent, so no response will ever arrive:
+		// do not leak the token in the response map.
+		nc.mu.Lock()
+		delete(nc.respMap, token)
+		nc.mu.Unlock()
 		return nil, token, err
 	}
 
@@ -5166,6 +5193,10 @@ func (nc *Conn) newRequest(subj string, hdr, data []byte, timeout time.Duration)
 		if !ok {
 			if nc.IsClosed() {
 				return nil, ErrConnectionClosed
+			}
+			if nc.IsDraining() {
+				// The drain canceled the pending requests.
+				return nil, ErrConnectionDraining
 			}
 			return nil, ErrDisconnected
 		}
@@ -5725,6 +5756,16 @@ func (nc *Conn) checkDrained(sub *Subscription) {
 	dc := sub.jsi != nil && sub.jsi.dc
 	sub.mu.Unlock()
 
+	// The drain is bounded by the connection's drain timeout: queued and
+	// in-flight messages get that long to be processed, after which the
+	// subscription is removed anyway so that the drain can not wait
+	// forever (for instance if messages keep arriving, or a synchronous
+	// subscription is no longer being read from).
+	nc.mu.Lock()
+	drainTimeout := nc.Opts.DrainTimeout
+	nc.mu.Unlock()
+	deadline := time.Now().Add(drainTimeout)
+
 	// Once we are here we just wait for Pending to reach 0 or
 	// any other state to exit this go routine.
 	for {
@@ -5753,6 +5794,20 @@ func (nc *Conn) checkDrained(sub *Subscription) {
 					nc.mu.Unlock()
 				}
 			}
+			return
+		}
+
+		// Past the deadline, give up on the remaining messages: remove
+		// the subscription and report that the drain did not complete
+		// in time. The connection drain (if any) relies on the removal
+		// to make progress, so this also bounds Conn.Drain.
+		if !time.Now().Before(deadline) {
+			nc.mu.Lock()
+			nc.removeSub(sub)
+			if errCB := nc.Opts.AsyncErrorCB; errCB != nil {
+				nc.ach.push(func() { errCB(nc, sub, ErrDrainTimeout) })
+			}
+			nc.mu.Unlock()
 			return
 		}
 
@@ -5821,10 +5876,18 @@ func (nc *Conn) unsubscribe(sub *Subscription, max int, drainMode bool) error {
 
 	if drainMode {
 		s.mu.Lock()
-		s.draining = true
-		sub.changeSubStatus(SubscriptionDraining)
+		// A subscription may be drained concurrently (for instance the
+		// user calling Drain while the connection itself is draining):
+		// start the drain watcher only once.
+		alreadyDraining := s.draining
+		if !alreadyDraining {
+			s.draining = true
+			sub.changeSubStatus(SubscriptionDraining)
+		}
 		s.mu.Unlock()
-		go nc.checkDrained(sub)
+		if !alreadyDraining {
+			go nc.checkDrained(sub)
+		}
 	}
 
 	// We will send these for all subs when we reconnect
@@ -6647,9 +6710,11 @@ func (nc *Conn) drainConnection() {
 		min = 0
 	}
 	for time.Now().Before(timeout) {
-		// Close clears all subscriptions, including respMux, so min
-		// would never be reached.
-		if nc.IsClosed() {
+		// Abort if the connection is no longer ours to drain: a
+		// concurrent Close has removed all subscriptions already, and
+		// a reconnect would mean this drain belongs to an old generation
+		// of the connection and must not affect the new one.
+		if !nc.IsDraining() {
 			return
 		}
 		if nc.NumSubscriptions() == min {
@@ -6666,6 +6731,9 @@ func (nc *Conn) drainConnection() {
 			pushErr(err)
 		}
 		for time.Now().Before(timeout) {
+			if !nc.IsDraining() {
+				return
+			}
 			if nc.NumSubscriptions() == 0 {
 				break
 			}
@@ -6678,13 +6746,20 @@ func (nc *Conn) drainConnection() {
 		pushErr(ErrDrainTimeout)
 	}
 
-	// Flip State, unless the connection was closed while we were
-	// draining subscriptions (for example by a concurrent Close call).
-	// In that case abort the publish drain: the connection is already
-	// terminal, and flipping the state here would resurrect it and
-	// start a new flush on a closed connection.
+	// The response subscription is gone now, so responses to requests
+	// that are still pending can never be matched: cancel those requests
+	// explicitly instead of letting them wait for their own timeout (or
+	// for the final Close) with no chance of being answered.
 	nc.mu.Lock()
-	if nc.isClosed() {
+	nc.clearPendingRequestCalls()
+
+	// Flip State, unless the connection left the draining state while we
+	// were draining subscriptions (for example by a concurrent Close or
+	// reconnect call). In that case abort the publish drain: the drain of
+	// this generation no longer owns the connection, and flipping the
+	// state here would resurrect a closed connection or hijack a new one
+	// and start a new flush on it.
+	if !nc.isDraining() {
 		nc.mu.Unlock()
 		return
 	}
