@@ -93,6 +93,11 @@ type (
 		info    atomic.Pointer[ConsumerInfo]
 		subs    syncx.Map[string, *pullSubscription]
 		pinID   string
+
+		// cacheGuard keeps CachedInfo honest when the consumer is updated
+		// through another API (see BindLegacyManager).
+		cacheGuard      CacheGuard
+		refreshInflight atomic.Bool
 	}
 
 	pullRequest struct {

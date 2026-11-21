@@ -160,6 +160,20 @@ type (
 		// exist, ErrStreamNotFound is returned.
 		DeleteStream(ctx context.Context, stream string) error
 
+		// GuardedStreamUpdate updates a stream, refusing the write with
+		// ErrLegacyRevisionConflict when expectedRevision no longer matches the
+		// server-side configuration. Without a revision option it is equivalent
+		// to UpdateStream. It provides cross-API revision/CAS semantics so an
+		// update racing a change from the legacy JetStreamManager can never
+		// silently overwrite it.
+		GuardedStreamUpdate(ctx context.Context, cfg StreamConfig, opts ...GuardedStreamUpdateOpt) (Stream, error)
+
+		// GuardedConsumerUpdate creates or updates a consumer, refusing the
+		// write with ErrLegacyRevisionConflict when expectedRevision no longer
+		// matches the server-side configuration. Without a revision option it is
+		// equivalent to CreateOrUpdateConsumer.
+		GuardedConsumerUpdate(ctx context.Context, streamName string, cfg ConsumerConfig, opts ...GuardedConsumerUpdateOpt) (Consumer, error)
+
 		// ListStreams returns StreamInfoLister, enabling iteration over a
 		// channel of stream infos.
 		ListStreams(context.Context, ...StreamListOpt) StreamInfoLister
@@ -353,6 +367,11 @@ type (
 		opts JetStreamOptions
 
 		publisher *jetStreamClient
+
+		// cacheGuard, when set (see BindLegacyManager), is propagated to every
+		// Stream/Consumer handle so their caches can be validated against
+		// updates performed through other APIs.
+		cacheGuard CacheGuard
 	}
 
 	// JetStreamOpt is a functional option for [New], [NewWithAPIPrefix] and
@@ -662,8 +681,9 @@ func (js *jetStream) CreateStream(ctx context.Context, cfg StreamConfig) (Stream
 	}
 
 	s := &stream{
-		js:   js,
-		name: cfg.Name,
+		js:         js,
+		name:       cfg.Name,
+		cacheGuard: js.cacheGuard,
 	}
 	s.info.Store(resp.StreamInfo)
 	return s, nil
@@ -789,8 +809,9 @@ func (js *jetStream) UpdateStream(ctx context.Context, cfg StreamConfig) (Stream
 	}
 
 	s := &stream{
-		js:   js,
-		name: cfg.Name,
+		js:         js,
+		name:       cfg.Name,
+		cacheGuard: js.cacheGuard,
 	}
 	s.info.Store(resp.StreamInfo)
 	return s, nil
@@ -837,8 +858,9 @@ func (js *jetStream) Stream(ctx context.Context, name string) (Stream, error) {
 		return nil, ErrInvalidJetStreamResponse
 	}
 	s := &stream{
-		js:   js,
-		name: name,
+		js:         js,
+		name:       name,
+		cacheGuard: js.cacheGuard,
 	}
 	s.info.Store(resp.StreamInfo)
 	return s, nil

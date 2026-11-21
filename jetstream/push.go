@@ -19,6 +19,11 @@ type (
 		name    string
 		info    atomic.Pointer[ConsumerInfo]
 		started atomic.Bool
+
+		// cacheGuard keeps CachedInfo honest when the consumer is updated
+		// through another API (see BindLegacyManager).
+		cacheGuard      CacheGuard
+		refreshInflight atomic.Bool
 	}
 
 	pushSubscription struct {

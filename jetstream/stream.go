@@ -172,6 +172,15 @@ type (
 		name string
 		info atomic.Pointer[StreamInfo]
 		js   *jetStream
+
+		// cacheGuard, when non-nil, is consulted by CachedInfo so that a cache
+		// populated before an update performed through another API (notably the
+		// legacy JetStreamManager) cannot be observed as a stale snapshot. It is
+		// wired up through BindLegacyManager.
+		cacheGuard CacheGuard
+
+		// refreshInflight coalesces concurrent CachedInfo-triggered refreshes.
+		refreshInflight atomic.Bool
 	}
 
 	// StreamInfoOpt is a function setting options for [Stream.Info]
@@ -508,8 +517,45 @@ func (s *stream) Info(ctx context.Context, opts ...StreamInfoOpt) (*StreamInfo, 
 // CachedInfo returns ConsumerInfo currently cached on this stream.
 // This method does not perform any network requests. The cached
 // StreamInfo is updated on every call to Info and Update.
+//
+// If a [CacheGuard] is attached (see [BindLegacyManager]) and it reports the
+// cache as stale - for example because the legacy JetStreamManager updated
+// the stream - CachedInfo transparently refreshes the cache from the server
+// before returning, so an update made through the other API can never be
+// observed as an old snapshot.
 func (s *stream) CachedInfo() *StreamInfo {
-	return s.info.Load()
+	cached := s.info.Load()
+	if s.cacheGuard == nil || cached == nil {
+		return cached
+	}
+	if s.cacheGuard.IsFresh(cached) {
+		return cached
+	}
+	return s.refreshCachedInfo()
+}
+
+// refreshCachedInfo re-fetches the stream info and stores it, but only if the
+// cache still holds the snapshot that was found stale. A concurrent Info or
+// Update that won the race is left untouched. Coalesced onto a single
+// in-flight refresh so a burst of concurrent CachedInfo calls costs one
+// server round trip.
+func (s *stream) refreshCachedInfo() *StreamInfo {
+	if !s.refreshInflight.CompareAndSwap(false, true) {
+		// Another caller is already refreshing; hand back the best snapshot we
+		// have rather than spawning a thundering herd of refresh requests.
+		return s.info.Load()
+	}
+	defer s.refreshInflight.Store(false)
+
+	ctx, cancel := s.js.wrapContextWithoutDeadline(context.Background())
+	defer cancel()
+	info, err := s.Info(ctx)
+	if err != nil {
+		// Refresh is best-effort: on failure keep serving the last known
+		// snapshot instead of turning a cache read into a hard error.
+		return s.info.Load()
+	}
+	return info
 }
 
 // Purge removes messages from a stream. It is a destructive operation.

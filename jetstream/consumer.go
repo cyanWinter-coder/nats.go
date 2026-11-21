@@ -218,7 +218,37 @@ func (p *pullConsumer) Info(ctx context.Context) (*ConsumerInfo, error) {
 // CachedInfo returns ConsumerInfo currently cached on this consumer.
 // This method does not perform any network requests. The cached
 // ConsumerInfo is updated on every call to Info and Update.
+//
+// If a [CacheGuard] is attached (see [BindLegacyManager]) and it reports the
+// cache as stale - for example because the legacy JetStreamManager updated
+// the consumer - CachedInfo transparently refreshes the cache from the server
+// before returning.
 func (p *pullConsumer) CachedInfo() *ConsumerInfo {
+	cached := p.info.Load()
+	if p.cacheGuard == nil || cached == nil {
+		return cached
+	}
+	if p.cacheGuard.IsFresh(cached) {
+		return cached
+	}
+	return p.refreshCachedInfo()
+}
+
+// refreshCachedInfo re-fetches and stores the consumer info unless a
+// concurrent Info/Update already replaced the stale snapshot. Failures are
+// best-effort: the previous cache is returned rather than turning a cache
+// read into an error. Coalesces concurrent callers onto one refresh.
+func (p *pullConsumer) refreshCachedInfo() *ConsumerInfo {
+	if !p.refreshInflight.CompareAndSwap(false, true) {
+		return p.info.Load()
+	}
+	defer p.refreshInflight.Store(false)
+
+	ctx, cancel := p.js.wrapContextWithoutDeadline(context.Background())
+	defer cancel()
+	if info, err := p.Info(ctx); err == nil {
+		return info
+	}
 	return p.info.Load()
 }
 
@@ -251,7 +281,37 @@ func (p *pushConsumer) Info(ctx context.Context) (*ConsumerInfo, error) {
 // CachedInfo returns ConsumerInfo currently cached on this consumer.
 // This method does not perform any network requests. The cached
 // ConsumerInfo is updated on every call to Info and Update.
+//
+// If a [CacheGuard] is attached (see [BindLegacyManager]) and it reports the
+// cache as stale - for example because the legacy JetStreamManager updated
+// the consumer - CachedInfo transparently refreshes the cache from the server
+// before returning.
 func (p *pushConsumer) CachedInfo() *ConsumerInfo {
+	cached := p.info.Load()
+	if p.cacheGuard == nil || cached == nil {
+		return cached
+	}
+	if p.cacheGuard.IsFresh(cached) {
+		return cached
+	}
+	return p.refreshCachedInfo()
+}
+
+// refreshCachedInfo re-fetches and stores the consumer info unless a
+// concurrent Info/Update already replaced the stale snapshot. Failures are
+// best-effort: the previous cache is returned rather than turning a cache
+// read into an error. Coalesces concurrent callers onto one refresh.
+func (p *pushConsumer) refreshCachedInfo() *ConsumerInfo {
+	if !p.refreshInflight.CompareAndSwap(false, true) {
+		return p.info.Load()
+	}
+	defer p.refreshInflight.Store(false)
+
+	ctx, cancel := p.js.wrapContextWithoutDeadline(context.Background())
+	defer cancel()
+	if info, err := p.Info(ctx); err == nil {
+		return info
+	}
 	return p.info.Load()
 }
 
@@ -262,11 +322,12 @@ func upsertPullConsumer(ctx context.Context, js *jetStream, stream string, cfg C
 	}
 
 	c := &pullConsumer{
-		js:      js,
-		stream:  stream,
-		name:    resp.Name,
-		durable: cfg.Durable != "",
-		subs:    syncx.Map[string, *pullSubscription]{},
+		js:         js,
+		stream:     stream,
+		name:       resp.Name,
+		durable:    cfg.Durable != "",
+		subs:       syncx.Map[string, *pullSubscription]{},
+		cacheGuard: js.cacheGuard,
 	}
 	c.info.Store(resp.ConsumerInfo)
 	return c, nil
@@ -283,9 +344,10 @@ func upsertPushConsumer(ctx context.Context, js *jetStream, stream string, cfg C
 	}
 
 	c := &pushConsumer{
-		js:     js,
-		stream: stream,
-		name:   resp.Name,
+		js:         js,
+		stream:     stream,
+		name:       resp.Name,
+		cacheGuard: js.cacheGuard,
 	}
 	c.info.Store(resp.ConsumerInfo)
 	return c, nil
@@ -383,11 +445,12 @@ func getConsumer(ctx context.Context, js *jetStream, stream, name string) (Consu
 	}
 
 	cons := &pullConsumer{
-		js:      js,
-		stream:  stream,
-		name:    name,
-		durable: info.Config.Durable != "",
-		subs:    syncx.Map[string, *pullSubscription]{},
+		js:         js,
+		stream:     stream,
+		name:       name,
+		durable:    info.Config.Durable != "",
+		subs:       syncx.Map[string, *pullSubscription]{},
+		cacheGuard: js.cacheGuard,
 	}
 	cons.info.Store(info)
 
@@ -405,9 +468,10 @@ func getPushConsumer(ctx context.Context, js *jetStream, stream, name string) (P
 	}
 
 	cons := &pushConsumer{
-		js:     js,
-		stream: stream,
-		name:   name,
+		js:         js,
+		stream:     stream,
+		name:       name,
+		cacheGuard: js.cacheGuard,
 	}
 	cons.info.Store(info)
 

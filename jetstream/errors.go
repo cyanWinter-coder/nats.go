@@ -511,6 +511,30 @@ var (
 	// ErrUpdateMetaDeleted is returned when the meta information of a deleted
 	// object cannot be updated.
 	ErrUpdateMetaDeleted JetStreamError = &jsError{message: "cannot update meta for a deleted object"}
+
+	// Compatibility layer errors (see legacy_compat.go)
+
+	// ErrLegacyFieldNotSupported is returned when converting a configuration
+	// between the legacy JetStream API (package nats) and the context-based
+	// JetStream API (package jetstream) and a field set by the caller has no
+	// representation in the target API. The failing field is reported in the
+	// error message, so the configuration is never silently downgraded.
+	ErrLegacyFieldNotSupported JetStreamError = &jsError{message: "field is not supported by the legacy JetStream API"}
+
+	// ErrLegacyRevisionConflict is returned by the guarded (revision-based)
+	// compatibility helpers when the configuration observed on the server no
+	// longer matches the revision the update was based on. The update is not
+	// sent, so the server-side revision/CAS semantics are preserved instead of
+	// the last writer blindly overwriting a concurrent change.
+	ErrLegacyRevisionConflict JetStreamError = &jsError{message: "jetstream resource revision conflict"}
+
+	// ErrRequestCanceledAfterDispatch is returned when the request was already
+	// written to the connection (and may therefore have been applied by the
+	// server) when the context was canceled or its deadline expired. Unlike a
+	// cancellation observed before sending the request, this outcome is
+	// ambiguous: callers must re-fetch the resource to determine whether the
+	// update took effect (a distinguishable partial-success state).
+	ErrRequestCanceledAfterDispatch JetStreamError = &jsError{message: "request canceled after it was dispatched; the operation may have completed on the server"}
 )
 
 // Error prints the JetStream API error code and description.

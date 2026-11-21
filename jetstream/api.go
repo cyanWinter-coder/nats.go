@@ -136,9 +136,17 @@ func (js *jetStream) apiRequest(ctx context.Context, subj string, data ...[]byte
 			ctrace.RequestSent(subj, req)
 		}
 	}
+	// A context that is already done before the request is sent fails
+	// deterministically: nothing was written to the wire, so the operation
+	// could not have taken effect. Preserve the plain context error in that
+	// case and reserve ErrRequestCanceledAfterDispatch for the ambiguous case
+	// where cancellation races an in-flight (already dispatched) request.
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	resp, err := js.conn.RequestWithContext(ctx, subj, req)
 	if err != nil {
-		return nil, err
+		return nil, newCanceledAfterDispatchError(err)
 	}
 	if js.opts.ClientTrace != nil {
 		ctrace := js.opts.ClientTrace
