@@ -14,7 +14,9 @@
 package nats
 
 import (
+	"errors"
 	"fmt"
+	"math"
 )
 
 type msgArg struct {
@@ -27,6 +29,35 @@ type msgArg struct {
 
 const MAX_CONTROL_LINE_SIZE = 4096
 
+// maxControlLineArgSize is the maximum number of bytes accepted in a single
+// protocol control line (the argument portion of MSG/HMSG/INFO/-ERR). A
+// malicious or broken peer must not be able to grow the parser's argBuf
+// without bound while waiting for a terminating CRLF.
+const maxControlLineArgSize = 64 * 1024
+
+// maxMsgSize is the maximum accepted value of the MSG/HMSG size fields. It is
+// validated before any payload allocation so a forged length can only trigger
+// an error, never an out-of-memory condition. It is deliberately above the
+// largest payload a conformant server negotiates (MaxPayload, 64MiB).
+const maxMsgSize = 128 * 1024 * 1024
+
+// maxHeaderLineSize is the maximum length of a single NATS header line. The
+// whole header block is already bounded by the message size; this additionally
+// rejects malformed peers that send oversized header fields.
+const maxHeaderLineSize = 64 * 1024
+
+// Parser errors. They are wrapped (not returned verbatim) so the historical
+// "nats: ..." wording of processMsgArgs errors is preserved while callers can
+// still match the failure class with errors.Is.
+var (
+	errParserControlLineTooLong = errors.New("nats: control line exceeds maximum size")
+	errParserBadSize            = errors.New("nats: bad or missing message size")
+	errParserBadSid             = errors.New("nats: bad or missing sid")
+	errParserBadHeaderSize      = errors.New("nats: bad or missing header size")
+	errParserMissingCRLF        = errors.New("nats: expected CRLF")
+	errParserHeaderLineTooLong  = errors.New("nats: header line exceeds maximum size")
+)
+
 type parseState struct {
 	state     int
 	as        int
@@ -36,6 +67,9 @@ type parseState struct {
 	argBuf    []byte
 	msgBuf    []byte
 	msgCopied bool
+	// crPending is true once the '\r' of a payload's terminating CRLF has
+	// been consumed in MSG_END; the next byte must be '\n'.
+	crPending bool
 	scratch   [MAX_CONTROL_LINE_SIZE]byte
 }
 
@@ -139,6 +173,12 @@ func (nc *Conn) parse(buf []byte) error {
 			default:
 				nc.ps.state = MSG_ARG
 				nc.ps.as = i
+				// A CR/LF immediately after the opcode spacing means an
+				// empty argument. Let MSG_ARG process it on the next
+				// iteration rather than capturing the byte as content.
+				if b == '\r' || b == '\n' {
+					i--
+				}
 			}
 		case MSG_ARG:
 			switch b {
@@ -146,21 +186,43 @@ func (nc *Conn) parse(buf []byte) error {
 				nc.ps.drop = 1
 			case '\n':
 				var arg []byte
-				if nc.ps.argBuf != nil {
+				switch {
+				case nc.ps.argBuf != nil:
 					arg = nc.ps.argBuf
-				} else {
+				case nc.ps.as <= i-nc.ps.drop:
 					arg = buf[nc.ps.as : i-nc.ps.drop]
+				default:
+					// Empty argument (e.g. a bare '\r' with no
+					// preceding bytes): the frame is malformed.
+					return errParserMissingCRLF
+				}
+				if len(arg) == 0 {
+					return errParserMissingCRLF
 				}
 				if err := nc.processMsgArgs(arg); err != nil {
 					return err
 				}
 				nc.ps.drop, nc.ps.as, nc.ps.state = 0, i+1, MSG_PAYLOAD
 
-				// jump ahead with the index. If this overruns
-				// what is left we fall out and process a split buffer.
-				i = nc.ps.as + nc.ps.ma.size - 1
+				// Jump ahead to the payload's final byte. If this overruns
+				// what is left we fall out and process a split buffer. A
+				// zero-size payload has no final byte, so just enter the
+				// payload state at the terminator.
+				if nc.ps.ma.size > 0 {
+					i = nc.ps.as + nc.ps.ma.size - 1
+				} else {
+					i = nc.ps.as - 1
+				}
 			default:
+				// A CR already marked the end of the argument line; the
+				// next byte must have been the LF handled above.
+				if nc.ps.drop > 0 {
+					return errParserMissingCRLF
+				}
 				if nc.ps.argBuf != nil {
+					if len(nc.ps.argBuf) >= maxControlLineArgSize {
+						return errParserControlLineTooLong
+					}
 					nc.ps.argBuf = append(nc.ps.argBuf, b)
 				}
 			}
@@ -168,7 +230,15 @@ func (nc *Conn) parse(buf []byte) error {
 			if nc.ps.msgBuf != nil {
 				if len(nc.ps.msgBuf) >= nc.ps.ma.size {
 					nc.processMsg(nc.ps.msgBuf)
-					nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.state = nil, nil, false, MSG_END
+					// The payload is complete. A lone LF terminates the
+					// frame immediately; a CR must still be completed by LF.
+					if b == '\n' {
+						nc.ps.crPending = false
+						nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.state = nil, nil, false, OP_START
+					} else {
+						nc.ps.crPending = b == '\r'
+						nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.state = nil, nil, false, MSG_END
+					}
 				} else {
 					// copy as much as we can to the buffer and skip ahead.
 					toCopy := nc.ps.ma.size - len(nc.ps.msgBuf)
@@ -190,14 +260,34 @@ func (nc *Conn) parse(buf []byte) error {
 					}
 				}
 			} else if i-nc.ps.as >= nc.ps.ma.size {
+				// At i-as == size, buf[i] is the first terminator byte
+				// (CR or LF); the payload is buf[as:i]. A lone LF ends the
+				// frame; a CR must be completed by a following LF.
 				nc.processMsg(buf[nc.ps.as:i])
-				nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.state = nil, nil, false, MSG_END
+				if b == '\n' {
+					nc.ps.crPending = false
+					nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.state = nil, nil, false, OP_START
+				} else {
+					nc.ps.crPending = b == '\r'
+					nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.state = nil, nil, false, MSG_END
+				}
 			}
 		case MSG_END:
-			switch b {
-			case '\n':
+			switch {
+			case nc.ps.crPending && b == '\n':
+				// Complete CRLF.
+				nc.ps.crPending = false
+				nc.ps.drop, nc.ps.as, nc.ps.state = 0, i+1, OP_START
+			case nc.ps.crPending:
+				// A CR was not completed by an LF: malformed terminator,
+				// and attempting to resynchronize would be ambiguous.
+				return errParserMissingCRLF
+			case b == '\n':
+				// Historical tolerance for a lone LF terminator.
 				nc.ps.drop, nc.ps.as, nc.ps.state = 0, i+1, OP_START
 			default:
+				// Stray bytes before the terminator are tolerated to
+				// preserve the historical lenient behavior.
 				continue
 			}
 		case OP_PLUS:
@@ -262,16 +352,25 @@ func (nc *Conn) parse(buf []byte) error {
 				nc.ps.drop = 1
 			case '\n':
 				var arg []byte
-				if nc.ps.argBuf != nil {
+				switch {
+				case nc.ps.argBuf != nil:
 					arg = nc.ps.argBuf
 					nc.ps.argBuf = nil
-				} else {
+				case nc.ps.as <= i-nc.ps.drop:
 					arg = buf[nc.ps.as : i-nc.ps.drop]
+				default:
+					return errParserMissingCRLF
 				}
 				nc.processErr(string(arg))
 				nc.ps.drop, nc.ps.as, nc.ps.state = 0, i+1, OP_START
 			default:
+				if nc.ps.drop > 0 {
+					return errParserMissingCRLF
+				}
 				if nc.ps.argBuf != nil {
+					if len(nc.ps.argBuf) >= maxControlLineArgSize {
+						return errParserControlLineTooLong
+					}
 					nc.ps.argBuf = append(nc.ps.argBuf, b)
 				}
 			}
@@ -366,16 +465,25 @@ func (nc *Conn) parse(buf []byte) error {
 				nc.ps.drop = 1
 			case '\n':
 				var arg []byte
-				if nc.ps.argBuf != nil {
+				switch {
+				case nc.ps.argBuf != nil:
 					arg = nc.ps.argBuf
 					nc.ps.argBuf = nil
-				} else {
+				case nc.ps.as <= i-nc.ps.drop:
 					arg = buf[nc.ps.as : i-nc.ps.drop]
+				default:
+					return errParserMissingCRLF
 				}
 				nc.processAsyncInfo(arg)
 				nc.ps.drop, nc.ps.as, nc.ps.state = 0, i+1, OP_START
 			default:
+				if nc.ps.drop > 0 {
+					return errParserMissingCRLF
+				}
 				if nc.ps.argBuf != nil {
+					if len(nc.ps.argBuf) >= maxControlLineArgSize {
+						return errParserControlLineTooLong
+					}
 					nc.ps.argBuf = append(nc.ps.argBuf, b)
 				}
 			}
@@ -385,9 +493,20 @@ func (nc *Conn) parse(buf []byte) error {
 	}
 	// Check for split buffer scenarios
 	if (nc.ps.state == MSG_ARG || nc.ps.state == MINUS_ERR_ARG || nc.ps.state == INFO_ARG) && nc.ps.argBuf == nil {
+		// i is len(buf) here. A trailing CR (drop == 1) must be excluded
+		// from the captured argument bytes.
+		end := i - nc.ps.drop
+		if end < nc.ps.as {
+			// The buffer ended on a bare CR with no argument bytes at all.
+			// Start an empty argBuf; the next byte must be LF (handled in
+			// the argument state's '\n' branch).
+			end = nc.ps.as
+		}
+		if end-nc.ps.as > maxControlLineArgSize {
+			return errParserControlLineTooLong
+		}
 		nc.ps.argBuf = nc.ps.scratch[:0]
-		nc.ps.argBuf = append(nc.ps.argBuf, buf[nc.ps.as:i-nc.ps.drop]...)
-		// FIXME, check max len
+		nc.ps.argBuf = append(nc.ps.argBuf, buf[nc.ps.as:end]...)
 	}
 	// Check for split msg
 	if nc.ps.state == MSG_PAYLOAD && nc.ps.msgBuf == nil {
@@ -464,20 +583,36 @@ func (nc *Conn) processMsgArgs(arg []byte) error {
 		nc.ps.ma.subject = args[0]
 		nc.ps.ma.sid = parseInt64(args[1])
 		nc.ps.ma.reply = nil
-		nc.ps.ma.size = int(parseInt64(args[2]))
+		size := parseInt64(args[2])
+		if err := validateMsgSize(size, arg); err != nil {
+			return err
+		}
+		nc.ps.ma.size = int(size)
 	case 4:
 		nc.ps.ma.subject = args[0]
 		nc.ps.ma.sid = parseInt64(args[1])
 		nc.ps.ma.reply = args[2]
-		nc.ps.ma.size = int(parseInt64(args[3]))
+		size := parseInt64(args[3])
+		if err := validateMsgSize(size, arg); err != nil {
+			return err
+		}
+		nc.ps.ma.size = int(size)
 	default:
 		return fmt.Errorf("nats: processMsgArgs Parse Error: '%s'", arg)
 	}
 	if nc.ps.ma.sid < 0 {
-		return fmt.Errorf("nats: processMsgArgs Bad or Missing Sid: '%s'", arg)
+		return fmt.Errorf("%w: processMsgArgs Bad or Missing Sid: '%s'", errParserBadSid, arg)
 	}
-	if nc.ps.ma.size < 0 {
-		return fmt.Errorf("nats: processMsgArgs Bad or Missing Size: '%s'", arg)
+	return nil
+}
+
+// validateMsgSize rejects missing, negative or implausibly large length fields
+// before any payload memory is allocated. It takes the untruncated int64 value
+// so an over-large field is caught even on 32-bit platforms, where converting
+// it to int could otherwise wrap into a small or negative number.
+func validateMsgSize(size int64, arg []byte) error {
+	if size < 0 || size > maxMsgSize {
+		return fmt.Errorf("%w: processMsgArgs Bad or Missing Size: '%s'", errParserBadSize, arg)
 	}
 	return nil
 }
@@ -510,25 +645,37 @@ func (nc *Conn) processHeaderMsgArgs(arg []byte) error {
 		nc.ps.ma.subject = args[0]
 		nc.ps.ma.sid = parseInt64(args[1])
 		nc.ps.ma.reply = nil
-		nc.ps.ma.hdr = int(parseInt64(args[2]))
-		nc.ps.ma.size = int(parseInt64(args[3]))
+		hdr := parseInt64(args[2])
+		size := parseInt64(args[3])
+		if err := validateMsgSize(size, arg); err != nil {
+			return err
+		}
+		if hdr < 0 || hdr > size {
+			return fmt.Errorf("%w: processHeaderMsgArgs Bad or Missing Header Size: '%s'",
+				errParserBadHeaderSize, arg)
+		}
+		nc.ps.ma.hdr = int(hdr)
+		nc.ps.ma.size = int(size)
 	case 5:
 		nc.ps.ma.subject = args[0]
 		nc.ps.ma.sid = parseInt64(args[1])
 		nc.ps.ma.reply = args[2]
-		nc.ps.ma.hdr = int(parseInt64(args[3]))
-		nc.ps.ma.size = int(parseInt64(args[4]))
+		hdr := parseInt64(args[3])
+		size := parseInt64(args[4])
+		if err := validateMsgSize(size, arg); err != nil {
+			return err
+		}
+		if hdr < 0 || hdr > size {
+			return fmt.Errorf("%w: processHeaderMsgArgs Bad or Missing Header Size: '%s'",
+				errParserBadHeaderSize, arg)
+		}
+		nc.ps.ma.hdr = int(hdr)
+		nc.ps.ma.size = int(size)
 	default:
 		return fmt.Errorf("nats: processHeaderMsgArgs Parse Error: '%s'", arg)
 	}
 	if nc.ps.ma.sid < 0 {
-		return fmt.Errorf("nats: processHeaderMsgArgs Bad or Missing Sid: '%s'", arg)
-	}
-	if nc.ps.ma.hdr < 0 || nc.ps.ma.hdr > nc.ps.ma.size {
-		return fmt.Errorf("nats: processHeaderMsgArgs Bad or Missing Header Size: '%s'", arg)
-	}
-	if nc.ps.ma.size < 0 {
-		return fmt.Errorf("nats: processHeaderMsgArgs Bad or Missing Size: '%s'", arg)
+		return fmt.Errorf("%w: processHeaderMsgArgs Bad or Missing Sid: '%s'", errParserBadSid, arg)
 	}
 	return nil
 }
@@ -540,7 +687,8 @@ const (
 )
 
 // parseInt64 expects decimal positive numbers. We
-// return -1 to signal error
+// return -1 to signal error (including empty input, non-digit
+// characters and int64 overflow).
 func parseInt64(d []byte) (n int64) {
 	if len(d) == 0 {
 		return -1
@@ -549,7 +697,13 @@ func parseInt64(d []byte) (n int64) {
 		if dec < ascii_0 || dec > ascii_9 {
 			return -1
 		}
-		n = n*10 + (int64(dec) - ascii_0)
+		digit := int64(dec - ascii_0)
+		// Guard against int64 overflow instead of silently wrapping
+		// into a small (or negative) accepted value.
+		if n > (math.MaxInt64-digit)/10 {
+			return -1
+		}
+		n = n*10 + digit
 	}
 	return n
 }

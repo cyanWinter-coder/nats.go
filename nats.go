@@ -2517,6 +2517,9 @@ build_string:
 		s += string(r.buf[r.off:r.n])
 		r.off = -1
 	}
+	if len(s) > maxControlLineArgSize {
+		return s, errParserControlLineTooLong
+	}
 	if _, err := r.Read(); err != nil {
 		return s, err
 	}
@@ -3936,6 +3939,8 @@ func (nc *Conn) readLoop() {
 			err = nc.parse(buf)
 		}
 		if err != nil {
+			// A parse/IO error terminates this loop; exactly one of the
+			// branches below runs, and no further reads happen on this conn.
 			// Report the write error rather than the read error it caused.
 			nc.mu.Lock()
 			if nc.bw.partialWriteErr != nil {
@@ -3943,7 +3948,7 @@ func (nc *Conn) readLoop() {
 			}
 			nc.mu.Unlock()
 			if shouldClose := nc.processOpErr(err, false); shouldClose {
-				nc.close(CLOSED, true, nil)
+				nc.close(CLOSED, true, err)
 			}
 			break
 		}
@@ -4774,6 +4779,9 @@ func DecodeHeadersMsg(data []byte) (Header, error) {
 	if !ok || len(l) < hdrPreEnd || l[:hdrPreEnd] != hdrLine[:hdrPreEnd] {
 		return nil, ErrBadHeaderMsg
 	}
+	if len(l) > maxHeaderLineSize {
+		return nil, errParserHeaderLineTooLong
+	}
 
 	h, err := readMIMEHeader(s)
 	if err != nil {
@@ -4815,6 +4823,9 @@ func readMIMEHeader(s string) (Header, error) {
 		if len(kv) == 0 {
 			// Blank line marks the end of the header block.
 			return m, nil
+		}
+		if len(kv) > maxHeaderLineSize {
+			return nil, errParserHeaderLineTooLong
 		}
 
 		// Process key fetching original case.
