@@ -749,8 +749,29 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 				}
 			}
 		case <-timeoutCh:
+			// A dead connection and an already-cancelled caller context are
+			// stronger terminals than the client-side wait, so they take
+			// precedence over the timeout even when both fired together.
+			if s.consumer.js.conn.IsClosed() {
+				s.Stop()
+				s.consumer.subs.Delete(s.id)
+				s.draining.CompareAndSwap(1, 0)
+				return nil, fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
+			}
+			if nextOpts.ctx != nil && nextOpts.ctx.Err() != nil {
+				return nil, nextOpts.ctx.Err()
+			}
 			return nil, nats.ErrTimeout
 		case <-ctxDone:
+			// Connection closure outranks caller cancellation: when the two
+			// coincide, the returned error must describe the terminal
+			// connection state rather than a cancellation it caused.
+			if s.consumer.js.conn.IsClosed() {
+				s.Stop()
+				s.consumer.subs.Delete(s.id)
+				s.draining.CompareAndSwap(1, 0)
+				return nil, fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
+			}
 			return nil, nextOpts.ctx.Err()
 		}
 	}
@@ -964,6 +985,7 @@ func (p *pullConsumer) fetch(req *pullRequest) (MessageBatch, error) {
 	sub := &pullSubscription{consumer: p}
 	var expiryTimer, heartbeatTimer *time.Timer
 	var stopContext func() bool
+	var connStatusCh chan nats.Status
 	var heartbeatDeadline time.Time
 	var receivedMsgs, receivedBytes int
 
@@ -971,10 +993,29 @@ func (p *pullConsumer) fetch(req *pullRequest) (MessageBatch, error) {
 	// cannot finish the fetch before its subscription and timers are ready.
 	res.Lock()
 	defer res.Unlock()
+	// resolveTerminal gives a fetch exactly one deterministic terminal state
+	// regardless of how many of its watchers fire together (heartbeat
+	// timeout, caller cancellation and connection closure). A dead
+	// connection always wins: a heartbeat timeout or a context cancellation
+	// observed while the connection is gone is a consequence of it, not an
+	// independent cause. Server-reported terminals (consumer deleted, bad
+	// request, ...) are passed through untouched.
+	resolveTerminal := func(err error) error {
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, ErrNoHeartbeat) || errors.Is(err, context.Canceled) {
+			if p.js.conn.IsClosed() {
+				return ErrConnectionClosed
+			}
+		}
+		return err
+	}
 	finish := func(err error) {
 		if res.done {
 			return
 		}
+		err = resolveTerminal(err)
 		res.err = err
 		res.done = true
 		if expiryTimer != nil {
@@ -985,6 +1026,12 @@ func (p *pullConsumer) fetch(req *pullRequest) (MessageBatch, error) {
 		}
 		if stopContext != nil {
 			stopContext()
+		}
+		if connStatusCh != nil {
+			// Deregister (and close) the status channel so the watcher
+			// goroutine exits. Events already buffered are ignored once
+			// res.done is set.
+			p.js.conn.RemoveStatusListener(connStatusCh)
 		}
 		if sub.subscription != nil {
 			sub.subscription.Unsubscribe()
@@ -1046,6 +1093,20 @@ func (p *pullConsumer) fetch(req *pullRequest) (MessageBatch, error) {
 		finish(err)
 		return nil, err
 	}
+	// A single pull request cannot be replayed across a new connection, so a
+	// permanently closed connection must terminate the fetch instead of
+	// leaving the caller blocked until the expiry or heartbeat timer fires.
+	connStatusCh = p.js.conn.StatusChanged(nats.CLOSED)
+	go func() {
+		for status := range connStatusCh {
+			if status == nats.CLOSED {
+				res.Lock()
+				finish(ErrConnectionClosed)
+				res.Unlock()
+				return
+			}
+		}
+	}()
 	req.PinID = p.getPinID()
 	subject := p.js.apiSubject(fmt.Sprintf(apiRequestNextT, p.stream, p.name))
 	if err := sub.pull(req, subject); err != nil {
