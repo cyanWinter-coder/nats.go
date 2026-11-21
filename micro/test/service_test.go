@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2577,5 +2578,273 @@ func TestEndpointPendingLimits(t *testing.T) {
 				t.Fatal("Expected the service to keep running after a slow consumer")
 			}
 		})
+	})
+}
+
+func TestServiceQueueGroupHandoverAfterStop(t *testing.T) {
+	withServer(t, func(t *testing.T, nc *nats.Conn) {
+		var handledA, handledB atomic.Int64
+		config := func(name string, handled *atomic.Int64) micro.Config {
+			return micro.Config{
+				Name:    name,
+				Version: "1.0.0",
+				Endpoint: &micro.EndpointConfig{
+					Subject: "qgroup.switch",
+					Handler: micro.HandlerFunc(func(req micro.Request) {
+						handled.Add(1)
+						req.Respond([]byte(name))
+					}),
+				},
+			}
+		}
+		svcA, err := micro.AddService(nc, config("svc-a", &handledA))
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		svcB, err := micro.AddService(nc, config("svc-b", &handledB))
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		defer svcB.Stop()
+
+		// Both members answer requests before the handover.
+		for range 4 {
+			if _, err := nc.Request("qgroup.switch", nil, time.Second); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		}
+
+		if err := svcA.Stop(); err != nil {
+			t.Fatalf("Unexpected error when stopping the service: %v", err)
+		}
+		stoppedAt := handledA.Load()
+
+		// After Stop returned, the leaving member must not take any new
+		// requests off the queue group; all of them go to the survivor.
+		for range 10 {
+			resp, err := nc.Request("qgroup.switch", nil, time.Second)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if string(resp.Data) != "svc-b" {
+				t.Fatalf("Expected the surviving member to answer; got %q", resp.Data)
+			}
+		}
+		if got := handledA.Load(); got != stoppedAt {
+			t.Fatalf("Expected the stopped member not to handle new requests; handled %d more", got-stoppedAt)
+		}
+	})
+}
+
+func TestServiceStopAnswersInFlightRequests(t *testing.T) {
+	withServer(t, func(t *testing.T, nc *nats.Conn) {
+		started := make(chan struct{}, 1)
+		srv, err := micro.AddService(nc, micro.Config{
+			Name:         "drain_inflight",
+			Version:      "1.0.0",
+			DrainTimeout: 5 * time.Second,
+			Endpoint: &micro.EndpointConfig{
+				Subject: "drain.inflight",
+				Handler: micro.HandlerFunc(func(req micro.Request) {
+					started <- struct{}{}
+					time.Sleep(200 * time.Millisecond)
+					req.Respond([]byte("done"))
+				}),
+			},
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		respCh := make(chan *nats.Msg, 1)
+		go func() {
+			resp, err := nc.Request("drain.inflight", nil, 2*time.Second)
+			if err == nil {
+				respCh <- resp
+			}
+		}()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("Timeout waiting for the handler to start")
+		}
+
+		// The in-flight request is answered within the drain timeout, so
+		// Stop succeeds and the requester receives the response.
+		if err := srv.Stop(); err != nil {
+			t.Fatalf("Unexpected error when stopping the service: %v", err)
+		}
+		select {
+		case resp := <-respCh:
+			if string(resp.Data) != "done" {
+				t.Fatalf("Unexpected response: %q", resp.Data)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Expected the in-flight request to be answered during drain")
+		}
+	})
+}
+
+func TestServiceStopDrainTimeoutDiscardsLateResponse(t *testing.T) {
+	withServer(t, func(t *testing.T, nc *nats.Conn) {
+		started := make(chan struct{}, 1)
+		release := make(chan struct{})
+		respondErr := make(chan error, 1)
+		srv, err := micro.AddService(nc, micro.Config{
+			Name:         "drain_timeout",
+			Version:      "1.0.0",
+			DrainTimeout: 100 * time.Millisecond,
+			Endpoint: &micro.EndpointConfig{
+				Subject: "drain.timeout",
+				Handler: micro.HandlerFunc(func(req micro.Request) {
+					started <- struct{}{}
+					<-release
+					respondErr <- req.Respond([]byte("late"))
+				}),
+			},
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		reqErr := make(chan error, 1)
+		go func() {
+			_, err := nc.Request("drain.timeout", nil, 2*time.Second)
+			reqErr <- err
+		}()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("Timeout waiting for the handler to start")
+		}
+
+		// The handler is still running when the drain timeout elapses.
+		if err := srv.Stop(); !errors.Is(err, micro.ErrDrainTimeout) {
+			t.Fatalf("Expected %v; got: %v", micro.ErrDrainTimeout, err)
+		}
+
+		// Once the handler finishes, its response is discarded: Respond
+		// fails and the requester never receives a message.
+		close(release)
+		select {
+		case err := <-respondErr:
+			if !errors.Is(err, micro.ErrRequestExpired) {
+				t.Fatalf("Expected %v; got: %v", micro.ErrRequestExpired, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Timeout waiting for the handler to respond")
+		}
+		select {
+		case err := <-reqErr:
+			if !errors.Is(err, nats.ErrTimeout) {
+				t.Fatalf("Expected the request to time out; got: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("Timeout waiting for the request to fail")
+		}
+	})
+}
+
+func TestServiceDuplicateResponse(t *testing.T) {
+	withServer(t, func(t *testing.T, nc *nats.Conn) {
+		secondRespond := make(chan error, 1)
+		errorAfterRespond := make(chan error, 1)
+		srv, err := micro.AddService(nc, micro.Config{
+			Name:    "dup_response",
+			Version: "1.0.0",
+			Endpoint: &micro.EndpointConfig{
+				Subject: "dup.response",
+				Handler: micro.HandlerFunc(func(req micro.Request) {
+					if err := req.Respond([]byte("first")); err != nil {
+						t.Errorf("Unexpected error: %v", err)
+					}
+					secondRespond <- req.Respond([]byte("second"))
+					errorAfterRespond <- req.Error("500", "too late", nil)
+				}),
+			},
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		defer srv.Stop()
+
+		replies, err := nc.SubscribeSync(nats.NewInbox())
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if err := nc.PublishRequest("dup.response", replies.Subject, nil); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		msg, err := replies.NextMsg(time.Second)
+		if err != nil {
+			t.Fatalf("Expected a response: %v", err)
+		}
+		if string(msg.Data) != "first" {
+			t.Fatalf("Unexpected response: %q", msg.Data)
+		}
+		// Only the first response is published.
+		if _, err := replies.NextMsg(100 * time.Millisecond); !errors.Is(err, nats.ErrTimeout) {
+			t.Fatalf("Expected no second response; got: %v", err)
+		}
+		if err := <-secondRespond; !errors.Is(err, micro.ErrAlreadyResponded) {
+			t.Fatalf("Expected %v; got: %v", micro.ErrAlreadyResponded, err)
+		}
+		if err := <-errorAfterRespond; !errors.Is(err, micro.ErrAlreadyResponded) {
+			t.Fatalf("Expected %v; got: %v", micro.ErrAlreadyResponded, err)
+		}
+	})
+}
+
+func TestServiceConcurrentStop(t *testing.T) {
+	withServer(t, func(t *testing.T, nc *nats.Conn) {
+		done := make(chan struct{}, 1)
+		srv, err := micro.AddService(nc, micro.Config{
+			Name:         "concurrent_stop",
+			Version:      "1.0.0",
+			DrainTimeout: time.Second,
+			DoneHandler:  func(micro.Service) { done <- struct{}{} },
+			Endpoint: &micro.EndpointConfig{
+				Subject: "concurrent.stop",
+				Handler: micro.HandlerFunc(func(req micro.Request) {
+					req.Respond([]byte("OK"))
+				}),
+			},
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		// Race user-initiated stops against the connection closing: the
+		// drain runs once and every waiter gets the same result.
+		const waiters = 8
+		results := make([]error, waiters)
+		var wg sync.WaitGroup
+		for i := range waiters {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results[i] = srv.Stop()
+			}()
+		}
+		nc.Close()
+		wg.Wait()
+		for i, err := range results {
+			if err != results[0] {
+				t.Fatalf("Expected all Stop callers to get the same result; results[0]=%v, results[%d]=%v", results[0], i, err)
+			}
+		}
+		if !srv.Stopped() {
+			t.Fatalf("Expected the service to be stopped")
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("Timeout on DoneHandler")
+		}
+		select {
+		case <-done:
+			t.Fatalf("DoneHandler called more than once")
+		case <-time.After(100 * time.Millisecond):
+		}
 	})
 }

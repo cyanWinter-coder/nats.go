@@ -3,6 +3,8 @@
 - [Overview](#overview)
 - [Basic usage](#basic-usage)
 - [Endpoints and groups](#endpoints-and-groups)
+- [Customizing queue groups](#customizing-queue-groups)
+- [Stopping a service](#stopping-a-service)
 - [Discovery and Monitoring](#discovery-and-monitoring)
 - [Examples](#examples)
 - [Documentation](#documentation)
@@ -174,6 +176,45 @@ a standard NATS subscription will be created for the endpoint.
 
 When disabling queue groups, same inheritance rules apply as for customizing
 queue groups. (service config -> group -> endpoint)
+
+## Stopping a service
+
+`Service.Stop()` shuts a service down gracefully. It first unsubscribes the
+service's endpoints and monitoring subjects, so a member leaving a queue group
+immediately stops receiving new requests (they are routed to the remaining
+members), and then waits for requests that are already being handled — or
+still queued on the service's subscriptions — to be answered:
+
+```go
+srv, _ := micro.AddService(nc, micro.Config{
+    Name:         "EchoService",
+    Version:      "1.0.0",
+    // Bound how long Stop waits for in-flight requests to be answered.
+    // Zero (the default) waits indefinitely.
+    DrainTimeout: 5 * time.Second,
+    Endpoint: &micro.EndpointConfig{
+        Subject: "svc.echo",
+        Handler: micro.HandlerFunc(echoHandler),
+    },
+})
+
+// Blocks until in-flight requests are answered or DrainTimeout elapses.
+// Safe to call concurrently; every caller receives the same result.
+err := srv.Stop()
+if errors.Is(err, micro.ErrDrainTimeout) {
+    // The timeout elapsed before all in-flight requests were answered.
+}
+```
+
+If `DrainTimeout` elapses first, the remaining subscriptions are unsubscribed
+and `Stop` returns `micro.ErrDrainTimeout`. A handler that finishes after its
+request expired can no longer write a response back: `Respond`, `RespondJSON`
+and `Error` fail with `micro.ErrRequestExpired` and nothing is published.
+
+Each request accepts exactly one response. Responding to the same request
+twice (for example from a handler racing a timeout path) returns
+`micro.ErrAlreadyResponded` and the second response is dropped, so a client
+never receives two replies for one request.
 
 ## Discovery and Monitoring
 

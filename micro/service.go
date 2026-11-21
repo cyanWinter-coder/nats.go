@@ -14,6 +14,7 @@
 package micro
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -48,6 +50,9 @@ type (
 		Reset()
 
 		// Stop drains the endpoint subscriptions and marks the service as stopped.
+		// It waits for in-flight and queued requests to be answered, bounded by
+		// [Config.DrainTimeout]. Concurrent and repeated calls are safe: the
+		// drain runs once and every caller receives its result.
 		Stop() error
 
 		// Stopped informs whether [Stop] was executed on the service.
@@ -191,6 +196,15 @@ type (
 		// QueueGroupDisabled disables the queue group for the service.
 		QueueGroupDisabled bool `json:"queue_group_disabled"`
 
+		// DrainTimeout bounds how long [Service.Stop] waits for requests that
+		// are already being handled (or queued on the service's subscriptions)
+		// to be answered after the service stops receiving new requests.
+		// When the timeout elapses, the remaining subscriptions are
+		// unsubscribed, pending handler responses are discarded (responding
+		// fails with [ErrRequestExpired]) and Stop returns [ErrDrainTimeout].
+		// Zero (the default) waits indefinitely.
+		DrainTimeout time.Duration `json:"drain_timeout,omitempty"`
+
 		// StatsHandler is a user-defined custom function.
 		// used to calculate additional service stats.
 		StatsHandler StatsHandler
@@ -246,6 +260,21 @@ type (
 		nc        *nats.Conn
 		stopped   bool
 
+		// inflight tracks requests currently being handled, including the
+		// ones queued on the service's subscriptions while they drain.
+		inflight atomic.Int64
+		// reqCtx is attached to every incoming request; reqCancel is called
+		// when the service stops waiting for in-flight requests, so that a
+		// late handler response is discarded instead of published.
+		reqCtx    context.Context
+		reqCancel context.CancelFunc
+
+		// stopOnce runs the drain exactly once; every Stop caller waits on
+		// stopDone and receives stopErr.
+		stopOnce sync.Once
+		stopDone chan struct{}
+		stopErr  error
+
 		asyncDispatcher asyncCallbacksHandler
 	}
 
@@ -300,6 +329,10 @@ var (
 
 	// ErrServiceNameRequired is returned when attempting to generate control subject with ID but empty name
 	ErrServiceNameRequired = errors.New("service name is required to generate ID control subject")
+
+	// ErrDrainTimeout is returned by [Service.Stop] when [Config.DrainTimeout]
+	// elapsed before all in-flight requests were answered.
+	ErrDrainTimeout = errors.New("timeout draining service")
 )
 
 func (s Verb) String() string {
@@ -336,10 +369,14 @@ func AddService(nc *nats.Conn, config Config) (Service, error) {
 	}
 
 	id := nuid.Next()
+	reqCtx, reqCancel := context.WithCancel(context.Background())
 	svc := &service{
-		Config: config,
-		nc:     nc,
-		id:     id,
+		Config:    config,
+		nc:        nc,
+		id:        id,
+		reqCtx:    reqCtx,
+		reqCancel: reqCancel,
+		stopDone:  make(chan struct{}),
 		asyncDispatcher: asyncCallbacksHandler{
 			cbQueue: make(chan func(), 100),
 			done:    make(chan struct{}),
@@ -364,6 +401,7 @@ func AddService(nc *nats.Conn, config Config) (Service, error) {
 		if err := svc.AddEndpoint("default", config.Endpoint.Handler, opts...); err != nil {
 			unregisterService(svc)
 			svc.asyncDispatcher.close()
+			svc.reqCancel()
 			return nil, err
 		}
 	}
@@ -396,6 +434,7 @@ func AddService(nc *nats.Conn, config Config) (Service, error) {
 		if err := svc.addVerbHandlers(nc, verb, handler); err != nil {
 			unregisterService(svc)
 			svc.asyncDispatcher.close()
+			svc.reqCancel()
 			return nil, err
 		}
 	}
@@ -453,14 +492,18 @@ func addEndpoint(s *service, name, subject string, handler Handler, metadata map
 			subject,
 			queueGroup,
 			func(m *nats.Msg) {
-				s.reqHandler(endpoint, &request{msg: m})
+				s.trackRequest()
+				defer s.untrackRequest()
+				s.reqHandler(endpoint, &request{msg: m, ctx: s.reqCtx})
 			},
 		)
 	} else {
 		sub, err = s.nc.Subscribe(
 			subject,
 			func(m *nats.Msg) {
-				s.reqHandler(endpoint, &request{msg: m})
+				s.trackRequest()
+				defer s.untrackRequest()
+				s.reqHandler(endpoint, &request{msg: m, ctx: s.reqCtx})
 			},
 		)
 	}
@@ -619,7 +662,9 @@ func (s *service) addInternalHandler(nc *nats.Conn, verb Verb, kind, id, name st
 	}
 
 	sub, err := nc.Subscribe(subj, func(msg *nats.Msg) {
-		handler(&request{msg: msg})
+		s.trackRequest()
+		defer s.untrackRequest()
+		handler(&request{msg: msg, ctx: s.reqCtx})
 	})
 	if err != nil {
 		if stopErr := s.Stop(); stopErr != nil {
@@ -633,6 +678,18 @@ func (s *service) addInternalHandler(nc *nats.Conn, verb Verb, kind, id, name st
 	return nil
 }
 
+// trackRequest registers a request about to be handled. It must be the first
+// thing a subscription callback does: a subscription reports drained only
+// after its last callback returned, so once no subscription is draining the
+// inflight count can only decrease.
+func (s *service) trackRequest() {
+	s.inflight.Add(1)
+}
+
+func (s *service) untrackRequest() {
+	s.inflight.Add(-1)
+}
+
 // reqHandler invokes the service request handler and modifies service stats
 func (s *service) reqHandler(endpoint *Endpoint, req *request) {
 	start := time.Now()
@@ -643,49 +700,99 @@ func (s *service) reqHandler(endpoint *Endpoint, req *request) {
 	avgProcessingTime := endpoint.stats.ProcessingTime.Nanoseconds() / int64(endpoint.stats.NumRequests)
 	endpoint.stats.AverageProcessingTime = time.Duration(avgProcessingTime)
 
-	if req.respondError != nil {
+	if respondErr := req.respondErr(); respondErr != nil {
 		endpoint.stats.NumErrors++
-		endpoint.stats.LastError = req.respondError.Error()
+		endpoint.stats.LastError = respondErr.Error()
 	}
 	s.m.Unlock()
 }
 
 // Stop drains the endpoint subscriptions and marks the service as stopped.
+// The drain runs once; concurrent and repeated callers all wait for it and
+// receive the same result.
 func (s *service) Stop() error {
+	s.stopOnce.Do(func() {
+		s.stopErr = s.stop()
+		close(s.stopDone)
+	})
+	<-s.stopDone
+	return s.stopErr
+}
+
+// stop unsubscribes the service from new requests, then waits for in-flight
+// and queued requests to be answered, bounded by Config.DrainTimeout.
+func (s *service) stop() error {
 	s.m.Lock()
-	defer s.m.Unlock()
-	if s.stopped {
-		return nil
-	}
-	// make a copy of s.endpoints to range over in order to stop
-	// since *Endpoint.stop manipulates s.endpoints!
-	endpointsToStop := append(make([]*Endpoint, 0, len(s.endpoints)), s.endpoints...)
-	for _, e := range endpointsToStop {
-		if err := e.stop(); err != nil {
-			return err
-		}
-	}
-	var keys []string
-	for key, sub := range s.verbSubs {
-		keys = append(keys, key)
-		if err := sub.Drain(); err != nil {
-			// connection is closed so draining is not possible
-			if errors.Is(err, nats.ErrConnectionClosed) {
-				break
-			}
-			return fmt.Errorf("draining subscription for subject %q: %w", sub.Subject, err)
-		}
-	}
-	for _, key := range keys {
-		delete(s.verbSubs, key)
-	}
-	unregisterService(s)
 	s.stopped = true
+	endpoints := s.endpoints
+	s.endpoints = nil
+	verbSubs := make([]*nats.Subscription, 0, len(s.verbSubs))
+	for _, sub := range s.verbSubs {
+		verbSubs = append(verbSubs, sub)
+	}
+	s.verbSubs = make(map[string]*nats.Subscription)
+	s.m.Unlock()
+
+	// Drain every subscription: the server is told to unsubscribe first, so
+	// a leaving queue group member stops receiving new requests right away,
+	// while messages already routed to it are still processed.
+	subs := make([]*nats.Subscription, 0, len(endpoints)+len(verbSubs))
+	var drainErr error
+	for _, e := range endpoints {
+		subs = append(subs, e.subscription)
+		if err := e.subscription.Drain(); err != nil && !errors.Is(err, nats.ErrConnectionClosed) {
+			drainErr = errors.Join(drainErr, fmt.Errorf("draining subscription for request handler: %w", err))
+		}
+	}
+	for _, sub := range verbSubs {
+		subs = append(subs, sub)
+		if err := sub.Drain(); err != nil && !errors.Is(err, nats.ErrConnectionClosed) {
+			drainErr = errors.Join(drainErr, fmt.Errorf("draining subscription for subject %q: %w", sub.Subject, err))
+		}
+	}
+
+	if !s.waitDrained(subs, s.Config.DrainTimeout) {
+		// The deadline elapsed: drop whatever is still pending and expire
+		// the request context so a late handler response is discarded
+		// instead of published.
+		for _, sub := range subs {
+			sub.Unsubscribe()
+		}
+		drainErr = errors.Join(drainErr, ErrDrainTimeout)
+	}
+	s.reqCancel()
+	unregisterService(s)
 	if s.DoneHandler != nil {
 		s.asyncDispatcher.push(func() { s.DoneHandler(s) })
 	}
 	s.asyncDispatcher.close()
-	return nil
+	return drainErr
+}
+
+// waitDrained reports whether all subscriptions finished draining and no
+// request is being handled anymore, waiting at most timeout (<= 0 waits
+// indefinitely).
+func (s *service) waitDrained(subs []*nats.Subscription, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		draining := false
+		for _, sub := range subs {
+			if sub.IsDraining() {
+				draining = true
+				break
+			}
+		}
+		// Checked after the draining flag: a subscription that is not
+		// draining will not invoke further callbacks, so the inflight count
+		// can only decrease from here.
+		if !draining && s.inflight.Load() == 0 {
+			return true
+		}
+		if timeout > 0 && time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (s *service) serviceIdentity() ServiceIdentity {
@@ -846,25 +953,6 @@ func (g *group) AddGroup(name string, opts ...GroupOpt) Group {
 		queueGroup:         queueGroup,
 		queueGroupDisabled: noQueue,
 	}
-}
-
-func (e *Endpoint) stop() error {
-	// Drain the subscription. If the connection is closed, draining is not possible
-	// but we should still remove the endpoint from the service.
-	if err := e.subscription.Drain(); err != nil && !errors.Is(err, nats.ErrConnectionClosed) {
-		return fmt.Errorf("draining subscription for request handler: %w", err)
-	}
-	for i := 0; i < len(e.service.endpoints); i++ {
-		if e.service.endpoints[i].Subject == e.Subject {
-			if i != len(e.service.endpoints)-1 {
-				e.service.endpoints = append(e.service.endpoints[:i], e.service.endpoints[i+1:]...)
-			} else {
-				e.service.endpoints = e.service.endpoints[:i]
-			}
-			i++
-		}
-	}
-	return nil
 }
 
 func (e *Endpoint) reset() {

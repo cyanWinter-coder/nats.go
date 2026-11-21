@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/nats-io/nats.go"
 )
@@ -71,7 +72,14 @@ type (
 
 	// request is a default implementation of Request interface
 	request struct {
-		msg          *nats.Msg
+		msg *nats.Msg
+		// ctx is canceled when the service stops waiting for this request
+		// (e.g. the drain timeout elapsed); responding afterwards fails with
+		// [ErrRequestExpired] and nothing is published.
+		ctx context.Context
+
+		mu           sync.Mutex
+		responded    bool
 		respondError error
 	}
 
@@ -85,6 +93,16 @@ var (
 	ErrRespond         = errors.New("NATS error when sending response")
 	ErrMarshalResponse = errors.New("marshaling response")
 	ErrArgRequired     = errors.New("argument required")
+
+	// ErrAlreadyResponded is returned when responding to a request which
+	// already received a response. A request accepts exactly one response;
+	// subsequent calls to Respond, RespondJSON or Error are dropped.
+	ErrAlreadyResponded = errors.New("response already sent")
+
+	// ErrRequestExpired is returned when responding to a request whose
+	// context has expired, e.g. the service drain timeout elapsed while the
+	// request was being handled. The response is not published.
+	ErrRequestExpired = errors.New("request expired")
 )
 
 func (fn HandlerFunc) Handle(req Request) {
@@ -101,6 +119,9 @@ func ContextHandler(ctx context.Context, handler func(context.Context, Request))
 
 // Respond sends the response for the request.
 // Additional headers can be passed using [WithHeaders] option.
+// Only the first response is published; subsequent calls return
+// [ErrAlreadyResponded]. Responding after the request context expired
+// (e.g. the drain timeout elapsed) returns [ErrRequestExpired].
 func (r *request) Respond(response []byte, opts ...RespondOpt) error {
 	respMsg := &nats.Msg{
 		Data: response,
@@ -109,12 +130,46 @@ func (r *request) Respond(response []byte, opts ...RespondOpt) error {
 		opt(respMsg)
 	}
 
+	if err := r.claim(); err != nil {
+		return err
+	}
 	if err := r.msg.RespondMsg(respMsg); err != nil {
-		r.respondError = fmt.Errorf("%w: %s", ErrRespond, err)
-		return r.respondError
+		respondErr := fmt.Errorf("%w: %s", ErrRespond, err)
+		r.setRespondError(respondErr)
+		return respondErr
 	}
 
 	return nil
+}
+
+// claim reports whether this call may publish the response: it fails if the
+// request context expired or a response was already claimed.
+func (r *request) claim() error {
+	if r.ctx != nil {
+		if err := r.ctx.Err(); err != nil {
+			return fmt.Errorf("%w: %w", ErrRequestExpired, err)
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.responded {
+		return ErrAlreadyResponded
+	}
+	r.responded = true
+	return nil
+}
+
+func (r *request) setRespondError(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.respondError = err
+}
+
+// respondErr returns the error recorded while responding, if any.
+func (r *request) respondErr() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.respondError
 }
 
 // RespondJSON marshals the given response value and responds to the request.
@@ -148,14 +203,17 @@ func (r *request) Error(code, description string, data []byte, opts ...RespondOp
 	}
 
 	response.Data = data
-	if err := r.msg.RespondMsg(response); err != nil {
-		r.respondError = err
+	if err := r.claim(); err != nil {
 		return err
 	}
-	r.respondError = &serviceError{
+	if err := r.msg.RespondMsg(response); err != nil {
+		r.setRespondError(err)
+		return err
+	}
+	r.setRespondError(&serviceError{
 		Code:        code,
 		Description: description,
-	}
+	})
 
 	return nil
 }
