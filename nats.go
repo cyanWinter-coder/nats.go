@@ -712,6 +712,7 @@ type Conn struct {
 	respMux       *Subscription        // A single response subscription
 	respMap       map[string]chan *Msg // Request map for the response msg channels
 	respRand      *rand.Rand           // Used for generating suffix
+	respGen       uint64               // Connection generation, embedded in response tokens
 
 	// Msg filters for testing.
 	// Protected by subsMu
@@ -3734,6 +3735,11 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 		// We are reconnected
 		nc.Reconnects++
 
+		// Bump the response generation so that late replies received
+		// on the previous connection can not complete requests made
+		// on this one, even if a response inbox is reused.
+		nc.respGen++
+
 		// Process connect logic
 		if nc.err = nc.processConnectInit(); nc.err != nil {
 			if reconnectErrCB := nc.Opts.ReconnectErrCB; reconnectErrCB != nil {
@@ -5072,6 +5078,14 @@ func (nc *Conn) respHandler(m *Msg) {
 	}
 }
 
+// removeRespWaiter removes the response waiter registered for the
+// given response token, if still present.
+func (nc *Conn) removeRespWaiter(token string) {
+	nc.mu.Lock()
+	delete(nc.respMap, token)
+	nc.mu.Unlock()
+}
+
 // Helper to setup and send new request style requests. Return the chan to receive the response.
 func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Msg, string, error) {
 	nc.mu.Lock()
@@ -5087,6 +5101,7 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 		// will be on a wildcard.
 		s, err := nc.subscribeLocked(nc.respSub, _EMPTY_, nc.respHandler, nil, nil, false, nil)
 		if err != nil {
+			delete(nc.respMap, token)
 			nc.mu.Unlock()
 			return nil, token, err
 		}
@@ -5095,6 +5110,9 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 	nc.mu.Unlock()
 
 	if err := nc.publish(subj, respInbox, false, hdr, data); err != nil {
+		// Do not leave the waiter behind, it would never be
+		// completed nor cleaned up.
+		nc.removeRespWaiter(token)
 		return nil, token, err
 	}
 
@@ -5170,9 +5188,22 @@ func (nc *Conn) newRequest(subj string, hdr, data []byte, timeout time.Duration)
 			return nil, ErrDisconnected
 		}
 	case <-t.C:
-		nc.mu.Lock()
-		delete(nc.respMap, token)
-		nc.mu.Unlock()
+		nc.removeRespWaiter(token)
+		// A response may have raced with the timer. Since the waiter
+		// has been removed, no other response can be delivered for
+		// this request, so check one last time and prefer the response
+		// over reporting a timeout.
+		select {
+		case msg, ok = <-mch:
+			if !ok {
+				if nc.IsClosed() {
+					return nil, ErrConnectionClosed
+				}
+				return nil, ErrDisconnected
+			}
+			return msg, nil
+		default:
+		}
 		return nil, ErrTimeout
 	}
 
@@ -5203,11 +5234,13 @@ func (nc *Conn) oldRequest(subj string, hdr, data []byte, timeout time.Duration)
 
 // InboxPrefix is the prefix for all inbox subjects.
 const (
-	InboxPrefix    = "_INBOX."
-	inboxPrefixLen = len(InboxPrefix)
-	replySuffixLen = 8 // Gives us 62^8
-	rdigits        = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	base           = 62
+	InboxPrefix      = "_INBOX."
+	inboxPrefixLen   = len(InboxPrefix)
+	replySuffixLen   = 8 // Gives us 62^8
+	respGenSuffixLen = 4 // Connection generation part of the response token, 62^4 generations
+	respTokenLen     = respGenSuffixLen + replySuffixLen
+	rdigits          = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	base             = 62
 )
 
 // NewInbox will return an inbox string which can be used for directed replies from
@@ -5254,8 +5287,17 @@ func (nc *Conn) newRespInbox() string {
 	}
 
 	var sb strings.Builder
-	sb.Grow(nc.respSubLen + replySuffixLen)
+	sb.Grow(nc.respSubLen + respTokenLen)
 	sb.WriteString(nc.respSubPrefix)
+
+	// Embed the connection generation so that a reply from a previous
+	// connection can never match a request of the current one, even if
+	// the random part of the token were to be reused.
+	gen := nc.respGen
+	for i := 0; i < respGenSuffixLen; i++ {
+		sb.WriteByte(rdigits[gen%base])
+		gen /= base
+	}
 
 	rn := nc.respRand.Int63()
 	for i := 0; i < replySuffixLen; i++ {

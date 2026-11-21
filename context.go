@@ -73,9 +73,7 @@ func (nc *Conn) requestWithContext(ctx context.Context, subj string, hdr, data [
 				return nil, ErrDisconnected
 			}
 		case <-ctx.Done():
-			nc.mu.Lock()
-			delete(nc.respMap, token)
-			nc.mu.Unlock()
+			nc.removeRespWaiter(token)
 			return nil, ctx.Err()
 		}
 	}
