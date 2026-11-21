@@ -87,6 +87,11 @@ type (
 		// received by the server. It only guarantees that the message has been
 		// sent to the server and thus messages can be stored in the stream
 		// out of order in case of retries.
+		//
+		// At most PublishAsyncMaxPending publishes are outstanding at once.
+		// When that cap is reached PublishAsync waits for a slot for at most
+		// the stall wait and then returns ErrTooManyStalledMsgs without
+		// publishing. Use [WithPublishContext] to cancel that wait.
 		PublishAsync(subject string, payload []byte, opts ...PublishOpt) (PubAckFuture, error)
 
 		// PublishMsgAsync performs a publish to a stream and returns
@@ -107,17 +112,22 @@ type (
 
 		// PublishAsyncComplete returns a channel that will be closed when all
 		// outstanding asynchronously published messages are acknowledged by the
-		// server.
+		// server, fail, or are aborted by [Publisher.CleanupPublisher].
 		//
-		// Callers blocked in PublishMsgAsync waiting for a free slot under
-		// PublishAsyncMaxPending are not outstanding yet, so the channel may
-		// be closed while such a caller is still about to publish.
+		// A future resolves exactly once: once it has an ack or an error, a
+		// late ack, timeout or reconnect cannot change it.
+		//
+		// Calls blocked in PublishAsync/PublishMsgAsync waiting for a free slot
+		// under PublishAsyncMaxPending count as outstanding, so the channel is
+		// not closed while they can still publish.
 		PublishAsyncComplete() <-chan struct{}
 
 		// CleanupPublisher will clean up the publishing side of JetStreamContext.
 		//
 		// This will unsubscribe from the internal reply subject if needed.
-		// All pending async publishes will fail with ErrJetStreamContextClosed.
+		// All pending async publishes will fail with ErrJetStreamPublisherClosed,
+		// as will calls blocked in PublishAsync/PublishMsgAsync waiting for a
+		// pending slot.
 		//
 		// If an error handler was provided, it will be called for each pending async
 		// publish and PublishAsyncComplete will be closed.
@@ -1284,7 +1294,10 @@ func (js *jetStream) wrapContextWithoutDeadline(ctx context.Context) (context.Co
 // CleanupPublisher will cleanup the publishing side of JetStreamContext.
 //
 // This will unsubscribe from the internal reply subject if needed.
-// All pending async publishes will fail with ErrJetStreamContextClosed.
+// All pending async publishes will fail with ErrJetStreamPublisherClosed, as
+// will calls blocked in PublishAsync/PublishMsgAsync waiting for a pending
+// slot under PublishAsyncMaxPending. Each future receives that error exactly
+// once; a future that was already resolved keeps its first result.
 //
 // If an error handler was provided, it will be called for each pending async
 // publish and PublishAsyncComplete will be closed.
@@ -1293,25 +1306,42 @@ func (js *jetStream) wrapContextWithoutDeadline(ctx context.Context) (context.Co
 // will be recreated on next publish, but the acks from previous publishes will
 // be lost.
 func (js *jetStream) CleanupPublisher() {
-	js.cleanupReplySub()
+	// Mark the publisher closed before removing the status listener. The
+	// reconnect watcher exits when that listener's channel closes, and this
+	// flag makes it leave pending futures to this method, so each one reports
+	// ErrJetStreamPublisherClosed rather than racing to ErrConnectionClosed.
 	js.publisher.Lock()
-	errCb := js.publisher.aecb
+	js.publisher.closed = true
+	js.publisher.epoch++
+	js.publisher.Unlock()
+
+	js.cleanupReplySub()
+
+	js.publisher.Lock()
+	var errCb MsgErrHandler
+	var msgs []*nats.Msg
 	for id, paf := range js.publisher.acks {
-		paf.err = ErrJetStreamPublisherClosed
-		if paf.errCh != nil {
-			paf.errCh <- paf.err
+		paf.deliverErrLocked(ErrJetStreamPublisherClosed)
+		delete(js.publisher.acks, id)
+		if errCb == nil {
+			errCb = js.publisher.asyncPublisherOpts.aecb
 		}
 		if errCb != nil {
-			// call error handler after releasing the mutex to avoid contention
-			defer errCb(js, paf.msg, ErrJetStreamPublisherClosed)
+			msgs = append(msgs, paf.msg)
 		}
-		delete(js.publisher.acks, id)
 	}
-	if js.publisher.doneCh != nil {
-		close(js.publisher.doneCh)
-		js.publisher.doneCh = nil
-	}
+	// Wake callers waiting for a slot; they observe closed and abort.
+	js.maybeUnstall()
+	dch := js.publisher.doneCh
+	js.publisher.doneCh = nil
 	js.publisher.Unlock()
+
+	for _, msg := range msgs {
+		errCb(js, msg, ErrJetStreamPublisherClosed)
+	}
+	if dch != nil {
+		close(dch)
+	}
 }
 
 func (js *jetStream) cleanupReplySub() {

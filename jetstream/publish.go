@@ -65,17 +65,26 @@ type (
 		// stallWait is the max wait of a async pub ack.
 		stallWait time.Duration
 
-		// internal option to re-use existing paf in case of retry.
-		pafRetry *pubAckFuture
+		// ctx aborts a call waiting for a pending slot (see
+		// [WithPublishContext]).
+		ctx context.Context
 	}
 
 	// PubAckFuture is a future for a PubAck.
 	// It can be used to wait for a PubAck or an error after an async publish.
+	//
+	// A future resolves exactly once: exactly one of Ok() and Err() delivers a
+	// value. Whichever result is recorded first wins; a later ack, timeout,
+	// reconnect or cleanup cannot change it.
 	PubAckFuture interface {
 		// Ok returns a receive only channel that can be used to get a PubAck.
+		// The channel receives at most one value and is never closed; a value
+		// means the server stored the message.
 		Ok() <-chan *PubAck
 
 		// Err returns a receive only channel that can be used to get the error from an async publish.
+		// The channel receives at most one value and is never closed. See
+		// [PublishAsync] for what each error implies about delivery.
 		Err() <-chan error
 
 		// Msg returns the message that was sent to the server.
@@ -88,12 +97,18 @@ type (
 		retries    int
 		maxRetries int
 		retryWait  time.Duration
-		ack        *PubAck
-		err        error
-		errCh      chan error
-		doneCh     chan *PubAck
-		reply      string
-		timeout    *time.Timer
+		// ack and err are the terminal result of the publish. They are
+		// written at most once, under jsClient's lock, by whichever outcome
+		// reaches the future first (ack, timeout, reconnect, cleanup). A
+		// future that already has a result ignores all later outcomes, so a
+		// reconnect racing an in-flight ack cannot report both success and
+		// failure for the same message.
+		ack     *PubAck
+		err     error
+		errCh   chan error
+		doneCh  chan *PubAck
+		reply   string
+		timeout *time.Timer
 	}
 
 	jetStreamClient struct {
@@ -121,9 +136,20 @@ type (
 		replyPrefix string
 		replySub    *nats.Subscription
 		acks        map[string]*pubAckFuture
-		stallCh     chan struct{}
-		doneCh      chan struct{}
-		rr          *rand.Rand
+		// stalled is the number of callers in registerPAF waiting for a
+		// pending slot. It is tracked separately from acks so completion is
+		// not signalled while a publisher is still about to send.
+		stalled int
+		stallCh chan struct{}
+		doneCh  chan struct{}
+		rr      *rand.Rand
+		// closed is set by CleanupPublisher. Pending futures and calls
+		// waiting for a slot are failed with ErrJetStreamPublisherClosed.
+		closed bool
+		// epoch is bumped by CleanupPublisher. A caller waiting for a slot
+		// records it and aborts if it changed, so a publisher reused after
+		// cleanup cannot revive a waiter that cleanup already targeted.
+		epoch uint64
 		// channel to signal when server is disconnected or conn is closed
 		connStatusCh chan (nats.Status)
 	}
@@ -263,6 +289,11 @@ func (js *jetStream) PublishMsg(ctx context.Context, m *nats.Msg, opts ...Publis
 	if o.stallWait > 0 {
 		return nil, fmt.Errorf("%w: stall wait cannot be set to sync publish", ErrInvalidOption)
 	}
+	// A per-publish context only bounds a pending-slot wait, which the
+	// synchronous path never does.
+	if o.ctx != nil {
+		return nil, fmt.Errorf("%w: publish context cannot be set to sync publish", ErrInvalidOption)
+	}
 
 	applyPublishHeaders(m, o)
 
@@ -310,6 +341,11 @@ func (js *jetStream) publishMsg(ctx context.Context, m *nats.Msg, retryWait time
 // PublishAsync performs an asynchronous publish to a stream and returns
 // [PubAckFuture] interface. It accepts subject name (which must be bound
 // to a stream) and message payload.
+//
+// PublishAsync never blocks waiting for an ack. It may block briefly while
+// the number of outstanding publishes is at the PublishAsyncMaxPending cap;
+// if that wait exceeds the stall wait, ErrTooManyStalledMsgs is returned and
+// nothing is published. Use [WithPublishContext] to cancel that wait.
 func (js *jetStream) PublishAsync(subj string, data []byte, opts ...PublishOpt) (PubAckFuture, error) {
 	return js.PublishMsgAsync(&nats.Msg{Subject: subj, Data: data}, opts...)
 }
@@ -334,89 +370,91 @@ func (js *jetStream) PublishMsgAsync(m *nats.Msg, opts ...PublishOpt) (PubAckFut
 		stallWait = o.stallWait
 	}
 
-	return js.publishMsgAsync(m, o.retryWait, o.retryAttempts, stallWait, o.pafRetry)
+	return js.publishMsgAsync(m, o.retryWait, o.retryAttempts, stallWait, o.ctx)
 }
 
 // publishMsgAsync performs the actual async publish and paf bookkeeping.
-// pafRetry is non-nil only when retrying an already-registered paf after
-// a no-responders error.
-func (js *jetStream) publishMsgAsync(m *nats.Msg, retryWait time.Duration, retryAttempts int, stallWait time.Duration, pafRetry *pubAckFuture) (PubAckFuture, error) {
-	paf := pafRetry
-	if paf == nil && m.Reply != "" {
+func (js *jetStream) publishMsgAsync(m *nats.Msg, retryWait time.Duration, retryAttempts int, stallWait time.Duration, ctx context.Context) (PubAckFuture, error) {
+	if m.Reply != "" {
 		return nil, ErrAsyncPublishReplySubjectSet
 	}
 
-	var id string
-	var reply string
-
-	// register new paf if not retrying
-	if paf == nil {
-		if err := js.newAsyncReply(); err != nil {
-			return nil, fmt.Errorf("nats: error creating async reply handler: %s", err)
-		}
-		paf = &pubAckFuture{msg: m, jsClient: js.publisher, maxRetries: retryAttempts, retryWait: retryWait}
-		var err error
-		reply, err = js.registerPAF(paf, stallWait)
-		if err != nil {
-			return nil, err
-		}
-		id = reply[js.opts.replyPrefixLen:]
-		if js.publisher.ackTimeout > 0 {
-			paf.timeout = time.AfterFunc(js.publisher.ackTimeout, func() {
-				js.publisher.Lock()
-				defer js.publisher.Unlock()
-
-				if _, ok := js.publisher.acks[id]; !ok {
-					// paf has already been resolved
-					// while waiting for the lock
-					return
-				}
-
-				// ack timed out, remove from pending acks
-				delete(js.publisher.acks, id)
-
-				// check on anyone stalled and waiting.
-				js.maybeUnstall()
-
-				// send error to user
-				paf.err = ErrAsyncPublishTimeout
-				if paf.errCh != nil {
-					paf.errCh <- paf.err
-				}
-
-				// call error callback if set
-				if js.publisher.asyncPublisherOpts.aecb != nil {
-					js.publisher.asyncPublisherOpts.aecb(js, paf.msg, ErrAsyncPublishTimeout)
-				}
-
-				// check on anyone one waiting on done status.
-				if js.publisher.doneCh != nil && len(js.publisher.acks) == 0 {
-					close(js.publisher.doneCh)
-					js.publisher.doneCh = nil
-				}
-			})
-		}
-	} else {
-		// when retrying, get the ID from existing reply subject
-		reply = paf.reply
-		if paf.timeout != nil {
-			paf.timeout.Reset(js.publisher.ackTimeout)
-		}
-		id = reply[js.opts.replyPrefixLen:]
+	if err := js.newAsyncReply(); err != nil {
+		return nil, fmt.Errorf("nats: error creating async reply handler: %s", err)
 	}
+	paf := &pubAckFuture{msg: m, jsClient: js.publisher, maxRetries: retryAttempts, retryWait: retryWait}
+	if stallWait <= 0 {
+		stallWait = defaultAsyncStallWait
+	}
+	reply, err := js.registerPAF(paf, stallWait, ctx)
+	if err != nil {
+		return nil, err
+	}
+	id := reply[js.opts.replyPrefixLen:]
 
-	pubMsg := &nats.Msg{
+	// The ack timer is started only once the publish has been handed to the
+	// connection. A timer armed before that could fire, resolve and remove
+	// the future while the send below is still in flight.
+	ackTimeout := js.publisher.ackTimeout
+
+	if err := js.conn.PublishMsg(&nats.Msg{
 		Subject: m.Subject,
 		Reply:   reply,
 		Data:    m.Data,
 		Header:  m.Header,
-	}
-	if err := js.conn.PublishMsg(pubMsg); err != nil {
+	}); err != nil {
+		// The message never left the client. The caller gets the error, so
+		// drop the registration rather than also reporting a terminal result
+		// (and invoking the error handler) for a publish that did not happen.
 		js.clearPAF(id)
 		return nil, err
 	}
 
+	if ackTimeout > 0 {
+		js.publisher.Lock()
+		if js.getPAF(id) != nil {
+			paf.timeout = time.AfterFunc(ackTimeout, func() {
+				js.publisher.Lock()
+				// Timer callbacks run outside any request path, so this
+				// resolves and removes the future on its own.
+				js.resolvePendingLocked(id, ErrAsyncPublishTimeout)()
+			})
+		}
+		js.publisher.Unlock()
+	}
+
 	return paf, nil
+}
+
+// retryPendingPublish resends a still-pending publish after a no-responders
+// reply. The future is not registered again and keeps its reply subject for
+// the whole retry sequence; if it was resolved in the meantime (ack, timeout,
+// reconnect or cleanup), the retry is dropped instead of producing a second
+// terminal result.
+func (js *jetStream) retryPendingPublish(id string) {
+	js.publisher.Lock()
+	paf := js.getPAF(id)
+	if paf == nil {
+		// Already resolved while the retry timer was pending.
+		js.publisher.Unlock()
+		return
+	}
+	if js.publisher.ackTimeout > 0 {
+		paf.timeoutReset(js.publisher.ackTimeout)
+	}
+	reply := paf.reply
+	msg := paf.msg
+	js.publisher.Unlock()
+
+	if err := js.conn.PublishMsg(&nats.Msg{
+		Subject: msg.Subject,
+		Reply:   reply,
+		Data:    msg.Data,
+		Header:  msg.Header,
+	}); err != nil {
+		js.publisher.Lock()
+		js.resolvePendingLocked(id, err)()
+	}
 }
 
 // For quick token lookup etc.
@@ -431,6 +469,10 @@ func (js *jetStream) newAsyncReply() error {
 	js.publisher.Lock()
 	defer js.publisher.Unlock()
 	if js.publisher.replySub == nil {
+		// CleanupPublisher unsubscribes the reply subject and marks the
+		// publisher closed; recreating the subscription starts a new era, so
+		// publishes after cleanup are accepted again.
+		js.publisher.closed = false
 		// Create our wildcard reply subject.
 		sha := sha256.New()
 		sha.Write([]byte(nuid.Next()))
@@ -461,132 +503,84 @@ func (js *jetStream) handleAsyncReply(m *nats.Msg) {
 	id := m.Subject[js.opts.replyPrefixLen:]
 
 	js.publisher.Lock()
-
 	paf := js.getPAF(id)
 	if paf == nil {
+		// The future was already resolved (timeout, reconnect, cleanup) or
+		// the reply is the late success of a retried publish. Either way it
+		// is not pending anymore, so this reply must not produce a result.
 		js.publisher.Unlock()
 		return
 	}
 
-	closeDchFn := func() func() {
-		var dch chan struct{}
-		// Check on anyone one waiting on done status.
-		if js.publisher.doneCh != nil && len(js.publisher.acks) == 0 {
-			dch = js.publisher.doneCh
-			js.publisher.doneCh = nil
-		}
-		// Return function to close done channel which
-		// should be deferred so that error is processed and
-		// can be checked.
-		return func() {
-			if dch != nil {
-				close(dch)
-			}
-		}
-	}
-
-	if paf.timeout != nil {
-		paf.timeout.Stop()
-	}
-
-	// Process no responders etc.
+	// Process no responders: schedule a resend of the same future. No result
+	// is recorded here, so a retry cannot compete with the ack of the
+	// previous attempt.
 	if len(m.Data) == 0 && m.Header.Get(statusHdr) == statusNoResponders {
 		if paf.retries < paf.maxRetries {
 			paf.retries++
-			time.AfterFunc(paf.retryWait, func() {
-				js.publisher.Lock()
-				paf := js.getPAF(id)
-				js.publisher.Unlock()
-				if paf == nil {
-					return
-				}
-				_, err := js.PublishMsgAsync(paf.msg, func(po *pubOpts) error {
-					po.pafRetry = paf
-					return nil
-				})
-				if err != nil {
-					js.publisher.Lock()
-					js.handleAsyncErrAndUnlock(paf, err)
-				}
-			})
+			// Pause the ack timer during the retry wait; retryPendingPublish
+			// restarts it for the new attempt.
+			paf.timeoutStop()
+			retryWait := paf.retryWait
 			js.publisher.Unlock()
+			time.AfterFunc(retryWait, func() {
+				js.retryPendingPublish(id)
+			})
 			return
 		}
-		delete(js.publisher.acks, id)
-		js.maybeUnstall()
-		defer closeDchFn()()
-		js.handleAsyncErrAndUnlock(paf, ErrNoStreamResponse)
+		js.resolvePendingLocked(id, ErrNoStreamResponse)()
 		return
 	}
-
-	// Remove
-	delete(js.publisher.acks, id)
-	js.maybeUnstall()
-	defer closeDchFn()()
 
 	var pa pubAckResponse
 	if err := json.Unmarshal(m.Data, &pa); err != nil {
-		js.handleAsyncErrAndUnlock(paf, ErrInvalidJSAck)
+		js.resolvePendingLocked(id, ErrInvalidJSAck)()
 		return
 	}
 	if pa.Error != nil {
-		js.handleAsyncErrAndUnlock(paf, pa.Error)
+		js.resolvePendingLocked(id, pa.Error)()
 		return
 	}
 	if pa.PubAck == nil || pa.PubAck.Stream == "" {
-		js.handleAsyncErrAndUnlock(paf, ErrInvalidJSAck)
+		js.resolvePendingLocked(id, ErrInvalidJSAck)()
 		return
 	}
 
 	// So here we have received a proper puback.
-	paf.ack = pa.PubAck
-	if paf.doneCh != nil {
-		paf.doneCh <- paf.ack
-	}
+	paf.deliverAckLocked(pa.PubAck)
+	delete(js.publisher.acks, id)
+	js.maybeUnstall()
+	dch := js.maybeComplete()
 	cb := js.publisher.asyncPublisherOpts.ackcb
 	js.publisher.Unlock()
 	if cb != nil {
 		cb(js, paf.msg, paf.ack)
 	}
+	if dch != nil {
+		close(dch)
+	}
 }
 
-func (js *jetStream) handleAsyncErrAndUnlock(paf *pubAckFuture, err error) {
-	paf.err = err
-	if paf.errCh != nil {
-		paf.errCh <- paf.err
+// resolvePendingLocked records err as the terminal result of the pending
+// publish with the given id and removes it. If the id is no longer pending (it
+// was already resolved), nothing happens, so only one terminal result can ever
+// be delivered. The lock must be held; the returned closure releases it and
+// runs the error handler and completion signal, so callers must invoke it.
+func (js *jetStream) resolvePendingLocked(id string, err error) func() {
+	paf := js.getPAF(id)
+	if paf == nil {
+		js.publisher.Unlock()
+		return func() {}
 	}
+	paf.deliverErrLocked(err)
+	delete(js.publisher.acks, id)
+	js.maybeUnstall()
+	dch := js.maybeComplete()
 	cb := js.publisher.asyncPublisherOpts.aecb
 	js.publisher.Unlock()
-	if cb != nil {
-		cb(js, paf.msg, err)
-	}
-}
-
-func (js *jetStream) resetPendingAcksOnReconnect(connStatusCh <-chan nats.Status) {
-	for {
-		newStatus, ok := <-connStatusCh
-		if !ok || newStatus == nats.CLOSED {
-			return
-		}
-		js.publisher.Lock()
-		errCb := js.publisher.asyncPublisherOpts.aecb
-		var msgs []*nats.Msg
-		for id, paf := range js.publisher.acks {
-			paf.err = nats.ErrDisconnected
-			if paf.errCh != nil {
-				paf.errCh <- paf.err
-			}
-			if errCb != nil {
-				msgs = append(msgs, paf.msg)
-			}
-			delete(js.publisher.acks, id)
-		}
-		js.maybeUnstall()
-		dch := js.publisher.doneCh
-		js.publisher.doneCh = nil
-		js.publisher.Unlock()
-		for _, msg := range msgs {
-			errCb(js, msg, nats.ErrDisconnected)
+	return func() {
+		if cb != nil {
+			cb(js, paf.msg, err)
 		}
 		if dch != nil {
 			close(dch)
@@ -594,20 +588,83 @@ func (js *jetStream) resetPendingAcksOnReconnect(connStatusCh <-chan nats.Status
 	}
 }
 
+// resetPendingAcksOnReconnect fails every publish that is still waiting for
+// an ack when the connection drops or closes. Once a future has failed here,
+// a late ack for it is ignored: the future has one terminal result.
+func (js *jetStream) resetPendingAcksOnReconnect(connStatusCh <-chan nats.Status) {
+	for {
+		newStatus, ok := <-connStatusCh
+		if !ok || newStatus == nats.CLOSED {
+			js.failPendingPublishes(ErrConnectionClosed)
+			return
+		}
+		js.failPendingPublishes(nats.ErrDisconnected)
+	}
+}
+
+// failPendingPublishes resolves all pending publishes with err. It also
+// releases callers waiting for a slot under the pending cap: they proceed and
+// register a new publish, which is tracked by the next status event.
+func (js *jetStream) failPendingPublishes(err error) {
+	js.publisher.Lock()
+	if js.publisher.closed {
+		// CleanupPublisher is resolving the pending futures, with its own
+		// terminal error; do not report a connection error for them too.
+		js.publisher.Unlock()
+		return
+	}
+	var errCb MsgErrHandler
+	var msgs []*nats.Msg
+	for id, paf := range js.publisher.acks {
+		paf.deliverErrLocked(err)
+		delete(js.publisher.acks, id)
+		if errCb == nil {
+			errCb = js.publisher.asyncPublisherOpts.aecb
+		}
+		if errCb != nil {
+			msgs = append(msgs, paf.msg)
+		}
+	}
+	js.maybeUnstall()
+	dch := js.maybeComplete()
+	js.publisher.Unlock()
+	for _, msg := range msgs {
+		errCb(js, msg, err)
+	}
+	if dch != nil {
+		close(dch)
+	}
+}
+
 // registerPAF will register for a PubAckFuture. If max pending is set and
-// the publisher is already at the cap, it stalls until a slot frees or
-// stallWait elapses. The reply token is drawn and inserted under the same
-// lock hold so pending cannot exceed maxPending and ids cannot collide
-// across stalled callers.
-func (js *jetStream) registerPAF(paf *pubAckFuture, stallWait time.Duration) (string, error) {
-	var timer *time.Timer
+// the publisher is already at the cap, it waits for a slot, ctx cancellation,
+// publisher cleanup, or stallWait. The reply token is drawn and inserted
+// under the same lock hold so pending cannot exceed maxPending and ids cannot
+// collide across waiting callers.
+func (js *jetStream) registerPAF(paf *pubAckFuture, stallWait time.Duration, ctx context.Context) (string, error) {
+	// Count the caller as waiting until it either registers or aborts, so
+	// PublishAsyncComplete cannot report completion to a caller that is still
+	// about to register.
+	js.publisher.Lock()
+	js.publisher.stalled++
+	js.publisher.Unlock()
+
 	defer func() {
-		if timer != nil {
-			timer.Stop()
+		js.publisher.Lock()
+		js.publisher.stalled--
+		dch := js.maybeComplete()
+		js.publisher.Unlock()
+		if dch != nil {
+			close(dch)
 		}
 	}()
+
 	for {
 		js.publisher.Lock()
+		if js.publisher.closed {
+			js.publisher.Unlock()
+			return "", ErrJetStreamPublisherClosed
+		}
 		if js.publisher.acks == nil {
 			js.publisher.acks = make(map[string]*pubAckFuture)
 		}
@@ -617,16 +674,37 @@ func (js *jetStream) registerPAF(paf *pubAckFuture, stallWait time.Duration) (st
 				js.publisher.stallCh = make(chan struct{})
 			}
 			stc := js.publisher.stallCh
+			epoch := js.publisher.epoch
 			js.publisher.Unlock()
-			if timer == nil {
-				timer = time.NewTimer(stallWait)
+
+			timer := time.NewTimer(stallWait)
+			var ctxDone <-chan struct{}
+			if ctx != nil {
+				ctxDone = ctx.Done()
 			}
+			var err error
 			select {
 			case <-stc:
-				continue
+				// A slot may have freed up, or cleanup failed the publisher.
+			case <-ctxDone:
+				err = ctx.Err()
 			case <-timer.C:
-				return "", ErrTooManyStalledMsgs
+				err = ErrTooManyStalledMsgs
 			}
+			timer.Stop()
+
+			if err == nil {
+				js.publisher.Lock()
+				if js.publisher.closed || js.publisher.epoch != epoch {
+					// Cleanup ran while we were waiting.
+					err = ErrJetStreamPublisherClosed
+				}
+				js.publisher.Unlock()
+			}
+			if err != nil {
+				return "", err
+			}
+			continue
 		}
 		// Allocate a unique reply token under the insert lock.
 		var id string
@@ -659,8 +737,8 @@ func (js *jetStream) getPAF(id string) *pubAckFuture {
 	return js.publisher.acks[id]
 }
 
-// maybeUnstall closes stallCh when under the max pending cap so a waiter
-// in registerPAF can proceed. Lock should be held.
+// maybeUnstall closes stallCh when a pending slot frees so a waiter in
+// registerPAF can proceed. Lock should be held.
 func (js *jetStream) maybeUnstall() {
 	if js.publisher.stallCh != nil && len(js.publisher.acks) < js.publisher.maxpa {
 		close(js.publisher.stallCh)
@@ -668,12 +746,60 @@ func (js *jetStream) maybeUnstall() {
 	}
 }
 
-// clearPAF will remove a PubAckFuture that was registered.
+// clearPAF removes a pending publish without recording a result. It is used
+// when a publish was registered but never handed to the connection.
 func (js *jetStream) clearPAF(id string) {
 	js.publisher.Lock()
 	delete(js.publisher.acks, id)
 	js.maybeUnstall()
 	js.publisher.Unlock()
+}
+
+// maybeComplete returns the completion channel and clears it when there is
+// nothing left that can still resolve a publish: no outstanding acks and no
+// publisher waiting for a slot. Lock should be held; the caller closes the
+// returned channel after releasing the lock.
+func (js *jetStream) maybeComplete() chan struct{} {
+	if js.publisher.doneCh != nil && len(js.publisher.acks) == 0 && js.publisher.stalled == 0 {
+		dch := js.publisher.doneCh
+		js.publisher.doneCh = nil
+		return dch
+	}
+	return nil
+}
+
+func (paf *pubAckFuture) timeoutStop() {
+	if paf.timeout != nil {
+		paf.timeout.Stop()
+	}
+}
+
+func (paf *pubAckFuture) timeoutReset(d time.Duration) {
+	if paf.timeout != nil {
+		paf.timeout.Reset(d)
+	}
+}
+
+// deliverAckLocked records a successful ack as the future's result and
+// notifies a waiter that already obtained Ok(). Lock must be held.
+func (paf *pubAckFuture) deliverAckLocked(ack *PubAck) {
+	paf.timeoutStop()
+	paf.ack = ack
+	paf.err = nil
+	if paf.doneCh != nil {
+		paf.doneCh <- ack
+	}
+}
+
+// deliverErrLocked records err as the future's result and notifies a waiter
+// that already obtained Err(). Lock must be held.
+func (paf *pubAckFuture) deliverErrLocked(err error) {
+	paf.timeoutStop()
+	paf.ack = nil
+	paf.err = err
+	if paf.errCh != nil {
+		paf.errCh <- err
+	}
 }
 
 func (paf *pubAckFuture) Ok() <-chan *PubAck {
@@ -720,11 +846,12 @@ func (js *jetStream) PublishAsyncPending() int {
 
 // PublishAsyncComplete returns a channel that will be closed when all
 // outstanding asynchronously published messages are acknowledged by the
-// server.
+// server, fail, or are aborted by CleanupPublisher.
 //
-// Callers blocked in PublishMsgAsync waiting for a free slot under
-// PublishAsyncMaxPending are not outstanding yet, so the channel may be
-// closed while such a caller is still about to publish.
+// Callers blocked in PublishMsgAsync/PublishAsync waiting for a free slot
+// under PublishAsyncMaxPending count as outstanding: the channel is not
+// closed until they either get a slot or give up, so a closed channel means
+// no publish can still start resolving later.
 func (js *jetStream) PublishAsyncComplete() <-chan struct{} {
 	js.publisher.Lock()
 	defer js.publisher.Unlock()
@@ -732,7 +859,7 @@ func (js *jetStream) PublishAsyncComplete() <-chan struct{} {
 		js.publisher.doneCh = make(chan struct{})
 	}
 	dch := js.publisher.doneCh
-	if len(js.publisher.acks) == 0 {
+	if len(js.publisher.acks) == 0 && js.publisher.stalled == 0 {
 		close(js.publisher.doneCh)
 		js.publisher.doneCh = nil
 	}

@@ -712,6 +712,63 @@ ackF, err = js.PublishAsync("ORDERS.new", []byte("hello"))
 Just as for synchronous publish, `PublishAsync()` and `PublishMsgAsync()` accept
 options for setting headers.
 
+#### Pending limit, cancellation and result guarantees
+
+`PublishAsync()` never waits for a server ack, but the number of publishes that
+can be outstanding at once is bounded by `WithPublishAsyncMaxPending` (4000 by
+default). When the cap is reached, a call waits briefly for a slot and then
+returns `ErrTooManyStalledMsgs` without publishing, so a stalled connection
+cannot make futures pile up without bound:
+
+```go
+js, _ := jetstream.New(nc, jetstream.WithPublishAsyncMaxPending(1000))
+
+ackF, err := js.PublishAsync("ORDERS.new", payload, jetstream.WithStallWait(time.Second))
+if errors.Is(err, jetstream.ErrTooManyStalledMsgs) {
+    // the publisher is saturated; back off and retry later
+}
+```
+
+`WithPublishContext` aborts that wait. It only affects a call that has not
+been published yet: once the message has been handed to the connection, the
+returned future resolves with the server's result regardless of the context.
+
+```go
+ackF, err := js.PublishAsync("ORDERS.new", payload,
+    jetstream.WithPublishContext(ctx),
+    jetstream.WithStallWait(time.Minute),
+)
+if errors.Is(err, context.Canceled) {
+    // canceled while waiting for a slot; nothing was published
+}
+```
+
+A `PubAckFuture` resolves exactly once. Its first result wins, and later
+events are ignored:
+
+- `<-ackF.Ok()` means the server stored the message and returned a `PubAck`.
+- `<-ackF.Err()` means the publish definitely did not produce an ack. The
+  error tells you what is known:
+  - `nats.ErrDisconnected`: the connection dropped (or reconnected) while the
+    message was unacknowledged. The message may or may not have reached the
+    stream; it is **unknown**. Do not assume it failed. Republish with a
+    `WithMsgID` and a deduplication window if the stream must contain it
+    exactly once.
+  - `ErrAsyncPublishTimeout`: no ack arrived within `WithPublishAsyncTimeout`.
+    Also **unknown** in the same way.
+  - `ErrNoStreamResponse`, `ErrInvalidJSAck`, or a server-side API error: the
+    server rejected the message or there was no stream to receive it.
+  - `context.Canceled`/`context.DeadlineExceeded`: the call was canceled before
+    the message was ever sent.
+  - `ErrJetStreamPublisherClosed`: `CleanupPublisher` was called before the
+    publish resolved.
+
+In particular, a reconnect can race an in-flight ack. The future reports at
+most one of the two outcomes: if the ack won, it is stored as success; if the
+disconnect was seen first, it is reported as `ErrDisconnected` and a late ack
+for that reply subject is dropped. `PublishAsyncComplete()` is only closed
+once no future can still resolve and no caller is still waiting for a slot.
+
 ## KeyValue Store
 
 JetStream KeyValue Stores offer a straightforward method for storing key-value

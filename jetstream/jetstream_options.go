@@ -740,6 +740,20 @@ func WithStallWait(ttl time.Duration) PublishOpt {
 	}
 }
 
+// WithPublishContext sets a context for an async publish. ctx aborts a call
+// blocked waiting for a pending slot under PublishAsyncMaxPending; in that
+// case ctx.Err() is returned and nothing is published.
+//
+// ctx does not cancel a publish that has already been sent: the returned
+// PubAckFuture still resolves with the server's result or a terminal error.
+// A nil ctx is ignored.
+func WithPublishContext(ctx context.Context) PublishOpt {
+	return func(opts *pubOpts) error {
+		opts.ctx = ctx
+		return nil
+	}
+}
+
 // Predefined schedule constants for use with [WithScheduleCron].
 const (
 	ScheduleYearly  = "@yearly"

@@ -34,7 +34,7 @@ func TestRegisterPAFUnstallOnClear(t *testing.T) {
 	}
 
 	paf0 := &pubAckFuture{jsClient: js.publisher}
-	reply0, err := js.registerPAF(paf0, time.Second)
+	reply0, err := js.registerPAF(paf0, time.Second, nil)
 	if err != nil {
 		t.Fatalf("registerPAF: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestRegisterPAFUnstallOnClear(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		paf := &pubAckFuture{jsClient: js.publisher}
-		_, err := js.registerPAF(paf, time.Second)
+		_, err := js.registerPAF(paf, time.Second, nil)
 		done <- err
 	}()
 
