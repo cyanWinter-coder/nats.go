@@ -86,13 +86,14 @@ type (
 
 	pullConsumer struct {
 		sync.Mutex
-		js      *jetStream
-		stream  string
-		durable bool
-		name    string
-		info    atomic.Pointer[ConsumerInfo]
-		subs    syncx.Map[string, *pullSubscription]
-		pinID   string
+		js         *jetStream
+		stream     string
+		durable    bool
+		name       string
+		info       atomic.Pointer[ConsumerInfo]
+		subs       syncx.Map[string, *pullSubscription]
+		pinID      string
+		generation atomic.Uint64
 	}
 
 	pullRequest struct {
@@ -150,6 +151,7 @@ type (
 		consumeOpts       *consumeOpts
 		delivered         int
 		closedCh          chan struct{}
+		sm                *pullStateMachine
 	}
 
 	pendingMsgs struct {
@@ -236,6 +238,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 		done:        make(chan struct{}, 1),
 		fetchNext:   make(chan *pullRequest, 1),
 		consumeOpts: consumeOpts,
+		sm:          newPullStateMachine(p.generation.Add(1)),
 	}
 	sub.connStatusChanged = p.js.conn.StatusChanged(nats.CONNECTED, nats.RECONNECTING, nats.CLOSED)
 
@@ -245,14 +248,10 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 	p.Unlock()
 
 	internalHandler := func(msg *nats.Msg) {
-		if sub.hbMonitor != nil {
-			sub.hbMonitor.Stop()
-		}
+		sub.stopHeartbeat()
 		userMsg, msgErr := checkMsg(msg)
 		if !userMsg && msgErr == nil {
-			if sub.hbMonitor != nil {
-				sub.hbMonitor.Reset(2 * consumeOpts.Heartbeat)
-			}
+			sub.resetHeartbeat(2 * consumeOpts.Heartbeat)
 			return
 		}
 		if !userMsg {
@@ -265,9 +264,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 			termErr, notifyErr := sub.handleStatusMsg(msg, msgErr)
 			if termErr == nil {
 				sub.checkPending()
-				if sub.hbMonitor != nil {
-					sub.hbMonitor.Reset(2 * consumeOpts.Heartbeat)
-				}
+				sub.resetHeartbeat(2 * consumeOpts.Heartbeat)
 			}
 			sub.Unlock()
 
@@ -288,14 +285,13 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 		if pinId := msg.Header.Get("Nats-Pin-Id"); pinId != "" {
 			p.setPinID(pinId)
 		}
+		sub.observeDeliverySeq(msg)
 		handler(p.js.toJSMsg(msg))
 		sub.Lock()
 		sub.decrementPendingMsgs(msg)
 		sub.incrementDeliveredMsgs()
 		sub.checkPending()
-		if sub.hbMonitor != nil {
-			sub.hbMonitor.Reset(2 * consumeOpts.Heartbeat)
-		}
+		sub.resetHeartbeat(2 * consumeOpts.Heartbeat)
 		sub.Unlock()
 
 		if sub.consumeOpts.StopAfter > 0 && sub.consumeOpts.StopAfter == sub.delivered {
@@ -356,9 +352,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 				}
 				switch status {
 				case nats.RECONNECTING:
-					if sub.hbMonitor != nil {
-						sub.hbMonitor.Stop()
-					}
+					sub.stopHeartbeat()
 					isConnected = false
 				case nats.CONNECTED:
 					sub.Lock()
@@ -380,9 +374,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 							Group:         sub.consumeOpts.Group,
 							PinID:         p.getPinID(),
 						})
-						if sub.hbMonitor != nil {
-							sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
-						}
+						sub.resetHeartbeat(2 * sub.consumeOpts.Heartbeat)
 					}
 					sub.Unlock()
 
@@ -404,9 +396,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 						Group:         sub.consumeOpts.Group,
 						PinID:         p.getPinID(),
 					})
-					if sub.hbMonitor != nil {
-						sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
-					}
+					sub.resetHeartbeat(2 * sub.consumeOpts.Heartbeat)
 				}
 				sub.Unlock()
 				if sub.consumeOpts.ErrHandler != nil {
@@ -513,6 +503,68 @@ func (s *pullSubscription) requestNext(req *pullRequest) {
 	}
 }
 
+// discardPendingFetches drops pull requests still queued for
+// pullMessages. It runs once the subscription is done, so no sender can
+// be blocked on the channel.
+func (s *pullSubscription) discardPendingFetches() {
+	for {
+		select {
+		case <-s.fetchNext:
+		default:
+			return
+		}
+	}
+}
+
+// rearmHeartbeat re-arms the heartbeat timer and records the new
+// deadline on the generation's state machine.
+func rearmHeartbeat(monitor *hbMonitor, sm *pullStateMachine, d time.Duration) {
+	if monitor != nil {
+		monitor.Reset(d)
+	}
+	if sm != nil {
+		sm.armHeartbeat(d)
+	}
+}
+
+// resetHeartbeat re-arms the subscription's heartbeat monitor together
+// with the state machine deadline.
+func (s *pullSubscription) resetHeartbeat(d time.Duration) {
+	rearmHeartbeat(s.hbMonitor, s.sm, d)
+}
+
+// stopHeartbeat pauses the heartbeat timer and clears the recorded
+// deadline, e.g. when the connection is lost.
+func (s *pullSubscription) stopHeartbeat() {
+	if s.hbMonitor != nil {
+		s.hbMonitor.Stop()
+	}
+	if s.sm != nil {
+		s.sm.disarmHeartbeat()
+	}
+}
+
+// observeDeliverySeq records the consumer delivery sequence of a user
+// message on the generation's state machine. Messages without
+// deliverable metadata (e.g. not sent in reply to a pull request) are
+// ignored.
+func (s *pullSubscription) observeDeliverySeq(msg *nats.Msg) {
+	if s.sm == nil {
+		return
+	}
+	tokens, err := parser.GetMetadataFields(msg.Reply)
+	if err != nil {
+		return
+	}
+	s.sm.observeDelivery(parser.ParseNum(tokens[parser.AckConsumerSeqTokenPos]))
+}
+
+// PullState returns a snapshot of the current state of this
+// subscription generation. It implements [PullStateReporter].
+func (s *pullSubscription) PullState() PullSubscriptionStateSnapshot {
+	return s.sm.snapshot()
+}
+
 // Messages returns MessagesContext, allowing continuously iterating
 // over messages on a stream. Messages cannot be used concurrently
 // when using ordered consumer.
@@ -552,6 +604,7 @@ func (p *pullConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error
 		errs:        make(chan error, 10),
 		fetchNext:   make(chan *pullRequest, 1),
 		consumeOpts: consumeOpts,
+		sm:          newPullStateMachine(p.generation.Add(1)),
 	}
 	sub.connStatusChanged = p.js.conn.StatusChanged(nats.CONNECTED, nats.RECONNECTING)
 	inbox := p.js.conn.NewInbox()
@@ -672,6 +725,9 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 		if hbMonitor != nil {
 			hbMonitor.Stop()
 		}
+		if s.sm != nil {
+			s.sm.disarmHeartbeat()
+		}
 	}()
 
 	if s.consumeOpts.StopAfter > 0 && s.delivered >= s.consumeOpts.StopAfter {
@@ -697,9 +753,7 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 				}
 				return nil, ErrMsgIteratorClosed
 			}
-			if hbMonitor != nil {
-				hbMonitor.Reset(2 * s.consumeOpts.Heartbeat)
-			}
+			rearmHeartbeat(hbMonitor, s.sm, 2*s.consumeOpts.Heartbeat)
 			userMsg, msgErr := checkMsg(msg)
 			if !userMsg {
 				// heartbeat message
@@ -715,6 +769,7 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 			if pinId := msg.Header.Get("Nats-Pin-Id"); pinId != "" {
 				s.consumer.setPinID(pinId)
 			}
+			s.observeDeliverySeq(msg)
 			s.decrementPendingMsgs(msg)
 			s.incrementDeliveredMsgs()
 			return s.consumer.js.toJSMsg(msg), nil
@@ -725,9 +780,7 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 				if s.consumeOpts.ReportMissingHeartbeats {
 					return nil, err
 				}
-				if hbMonitor != nil {
-					hbMonitor.Reset(2 * s.consumeOpts.Heartbeat)
-				}
+				rearmHeartbeat(hbMonitor, s.sm, 2*s.consumeOpts.Heartbeat)
 			}
 			if errors.Is(err, errConnected) {
 				// errConnected is only sent for a CONNECTED that follows a
@@ -739,13 +792,14 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 				}
 				s.pending.msgCount = 0
 				s.pending.byteCount = 0
-				if hbMonitor != nil {
-					hbMonitor.Reset(2 * s.consumeOpts.Heartbeat)
-				}
+				rearmHeartbeat(hbMonitor, s.sm, 2*s.consumeOpts.Heartbeat)
 			}
 			if errors.Is(err, errDisconnected) {
 				if hbMonitor != nil {
 					hbMonitor.Stop()
+				}
+				if s.sm != nil {
+					s.sm.disarmHeartbeat()
 				}
 			}
 		case <-timeoutCh:
@@ -763,7 +817,15 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 func (s *pullSubscription) handleStatusMsg(msg *nats.Msg, msgErr error) (error, error) {
 	if !errors.Is(msgErr, nats.ErrTimeout) && !errors.Is(msgErr, ErrMaxBytesExceeded) && !errors.Is(msgErr, ErrBatchCompleted) {
 		if errors.Is(msgErr, ErrConsumerDeleted) || errors.Is(msgErr, ErrBadRequest) {
+			// terminal status: record the cause on the generation; the
+			// caller's Stop performs the actual close.
+			if s.sm != nil {
+				s.sm.terminate(msgErr)
+			}
 			return msgErr, nil
+		}
+		if s.sm != nil {
+			s.sm.transition(PullStateTransientError)
 		}
 		if errors.Is(msgErr, ErrPinIDMismatch) {
 			s.consumer.setPinID("")
@@ -775,6 +837,9 @@ func (s *pullSubscription) handleStatusMsg(msg *nats.Msg, msgErr error) (error, 
 			s.pending.byteCount = 0
 		}
 		return nil, msgErr
+	}
+	if s.sm != nil {
+		s.sm.transition(PullStateServerEnded)
 	}
 	msgsLeft, bytesLeft, err := parsePending(msg)
 	if err != nil {
@@ -828,6 +893,9 @@ func (s *pullSubscription) Stop() {
 	if !s.closed.CompareAndSwap(0, 1) {
 		return
 	}
+	if s.sm != nil {
+		s.sm.terminate(nil)
+	}
 	close(s.done)
 }
 
@@ -845,6 +913,9 @@ func (s *pullSubscription) Drain() {
 	s.draining.Store(1)
 	if !s.closed.CompareAndSwap(0, 1) {
 		return
+	}
+	if s.sm != nil {
+		s.sm.terminate(nil)
 	}
 	close(s.done)
 }
@@ -961,7 +1032,7 @@ func (p *pullConsumer) fetch(req *pullRequest) (MessageBatch, error) {
 		resultBufferSize = min(resultBufferSize, req.MaxBytes)
 	}
 	res := &fetchResult{msgs: make(chan Msg, resultBufferSize)}
-	sub := &pullSubscription{consumer: p}
+	sub := &pullSubscription{consumer: p, sm: newPullStateMachine(p.generation.Add(1))}
 	var expiryTimer, heartbeatTimer *time.Timer
 	var stopContext func() bool
 	var heartbeatDeadline time.Time
@@ -977,6 +1048,9 @@ func (p *pullConsumer) fetch(req *pullRequest) (MessageBatch, error) {
 		}
 		res.err = err
 		res.done = true
+		if sub.sm != nil {
+			sub.sm.terminate(err)
+		}
 		if expiryTimer != nil {
 			expiryTimer.Stop()
 		}
@@ -1028,6 +1102,9 @@ func (p *pullConsumer) fetch(req *pullRequest) (MessageBatch, error) {
 			return
 		}
 		res.sseq = parser.ParseNum(tokens[parser.AckStreamSeqTokenPos])
+		if sub.sm != nil {
+			sub.sm.observeDelivery(parser.ParseNum(tokens[parser.AckConsumerSeqTokenPos]))
+		}
 		receivedMsgs++
 		if req.MaxBytes != 0 {
 			receivedBytes += msg.Size()
@@ -1156,8 +1233,17 @@ func (s *pullSubscription) scheduleHeartbeatCheck(dur time.Duration) *hbMonitor 
 	if dur == 0 {
 		return nil
 	}
+	if s.sm != nil {
+		s.sm.armHeartbeat(2 * dur)
+	}
 	return &hbMonitor{
 		timer: time.AfterFunc(2*dur, func() {
+			// A delivery or status reply may have re-armed the deadline
+			// after this timer fired; only a genuinely expired deadline
+			// ends the current wait.
+			if s.sm != nil && !s.sm.heartbeatExpired(time.Now()) {
+				return
+			}
 			select {
 			case s.errs <- ErrNoHeartbeat:
 			case <-s.done:
@@ -1172,6 +1258,10 @@ func (s *pullSubscription) cleanup() {
 	// is already holding the lock and waiting.
 	// The fields that are read (subscription, hbMonitor)
 	// are read only (Only written on creation of pullSubscription).
+
+	// The generation is over: discard any pull requests still queued for
+	// pullMessages so no fetch outlives the terminal state.
+	s.discardPendingFetches()
 
 	// The status listener and the heartbeat timer have to be released
 	// even if the subscription is no longer valid (e.g. the connection
@@ -1217,6 +1307,9 @@ func (s *pullSubscription) pull(req *pullRequest, subject string) error {
 
 	if err := s.consumer.js.conn.PublishRequest(subject, reply, reqJSON); err != nil {
 		return err
+	}
+	if s.sm != nil {
+		s.sm.transition(PullStateFetching)
 	}
 	return nil
 }
