@@ -15,6 +15,7 @@ package micro
 
 import (
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -103,4 +104,65 @@ func TestNATSErrorWrapping(t *testing.T) {
 	if natsErr.Error() != expectedMsg {
 		t.Errorf("Error() = %q, want %q", natsErr.Error(), expectedMsg)
 	}
+}
+
+// TestRequestResponseClaim verifies the response ownership boundary without
+// a server: only the first claim succeeds and every later Respond, RespondJSON
+// or Error attempt is rejected with ErrRequestAlreadyResponded.
+func TestRequestResponseClaim(t *testing.T) {
+	t.Run("claim once", func(t *testing.T) {
+		r := &request{}
+		if err := r.claimResponse(); err != nil {
+			t.Fatalf("first claim failed: %v", err)
+		}
+		for i := 0; i < 3; i++ {
+			if err := r.claimResponse(); !errors.Is(err, ErrRequestAlreadyResponded) {
+				t.Fatalf("claim %d: want %v; got %v", i+2, ErrRequestAlreadyResponded, err)
+			}
+		}
+	})
+
+	t.Run("concurrent claims", func(t *testing.T) {
+		r := &request{}
+		var won, lost int64
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range 50 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				err := r.claimResponse()
+				mu.Lock()
+				if err == nil {
+					won++
+				} else if errors.Is(err, ErrRequestAlreadyResponded) {
+					lost++
+				} else {
+					t.Errorf("unexpected error: %v", err)
+				}
+				mu.Unlock()
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if won != 1 || lost != 49 {
+			t.Fatalf("want exactly 1 winning claim and 49 rejections; got %d won, %d lost", won, lost)
+		}
+	})
+
+	t.Run("validation errors do not claim", func(t *testing.T) {
+		r := &request{}
+		if err := r.Error("", "desc", nil); !errors.Is(err, ErrArgRequired) {
+			t.Fatalf("want %v; got %v", ErrArgRequired, err)
+		}
+		if err := r.Error("500", "", nil); !errors.Is(err, ErrArgRequired) {
+			t.Fatalf("want %v; got %v", ErrArgRequired, err)
+		}
+		// The request was never claimed, so a later claim still succeeds.
+		if err := r.claimResponse(); err != nil {
+			t.Fatalf("claim after failed validation should succeed; got %v", err)
+		}
+	})
 }

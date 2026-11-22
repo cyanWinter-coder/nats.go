@@ -292,6 +292,47 @@ nats req '$SRV.STATS.EchoService.x3Yuiq7g7MoxhXdxk7i4K7' '' | jq
 }
 ```
 
+## Stopping a service
+
+`Stop` drains a service with a deterministic commit boundary:
+
+1. Interest on every endpoint and monitoring subject is removed first, so no
+   new requests are accepted once draining begins. Requests the service
+   already accepted keep running.
+2. `Stop` waits for every in-flight request handler to return. Set
+   `Config.DrainTimeout` to bound the wait: when the deadline expires `Stop`
+   returns `ErrServiceDrainTimeout`, leaves the service in the stopping state
+   (still refusing new requests and endpoints) and can be called again to keep
+   waiting. With a zero timeout `Stop` waits without a deadline.
+3. Only then is the service marked stopped, its connection hooks released and
+   the `DoneHandler` invoked — exactly once, after all accepted requests have
+   converged. Closing the connection stops its services as well; in that case
+   responses can no longer be delivered, so the `DoneHandler` fires without
+   waiting on handlers that cannot observe the close.
+
+Each request owns a single response: the first `Respond`, `RespondJSON` or
+`Error` call publishes it, and every later call fails with
+`ErrRequestAlreadyResponded` without sending another message. A queue-group
+member that has stopped leaves the group, so the server stops routing requests
+to it and its replies cannot affect the surviving group.
+
+```go
+srv, err := micro.AddService(nc, micro.Config{
+    Name:         "orders",
+    Version:      "1.0.0",
+    DrainTimeout: 10 * time.Second,
+    DoneHandler:  func(micro.Service) { log.Println("service drained") },
+    // ...
+})
+if err != nil {
+    log.Fatal(err)
+}
+if err := srv.Stop(); errors.Is(err, micro.ErrServiceDrainTimeout) {
+    // Requests are still in flight; retry later to finish the drain.
+    log.Print(srv.Stop())
+}
+```
+
 ## Examples
 
 For more detailed examples, refer to the `./test/example_test.go` directory in

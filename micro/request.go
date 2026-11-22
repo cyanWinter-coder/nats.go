@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/nats-io/nats.go"
 )
@@ -71,7 +72,13 @@ type (
 
 	// request is a default implementation of Request interface
 	request struct {
-		msg          *nats.Msg
+		msg *nats.Msg
+
+		// respMu guards responded and respondError. A request can only be
+		// responded to once: the first Respond, RespondJSON or Error call
+		// claims the response, later calls fail with ErrRequestAlreadyResponded.
+		respMu       sync.Mutex
+		responded    bool
 		respondError error
 	}
 
@@ -85,6 +92,11 @@ var (
 	ErrRespond         = errors.New("NATS error when sending response")
 	ErrMarshalResponse = errors.New("marshaling response")
 	ErrArgRequired     = errors.New("argument required")
+
+	// ErrRequestAlreadyResponded is returned by Respond, RespondJSON and Error
+	// when the request has already been responded to. Only the first response
+	// is published; every later attempt fails without sending another message.
+	ErrRequestAlreadyResponded = errors.New("request already responded")
 )
 
 func (fn HandlerFunc) Handle(req Request) {
@@ -101,7 +113,15 @@ func ContextHandler(ctx context.Context, handler func(context.Context, Request))
 
 // Respond sends the response for the request.
 // Additional headers can be passed using [WithHeaders] option.
+//
+// A request can only be responded to once. The first call claims the
+// response and publishes it; subsequent calls return
+// [ErrRequestAlreadyResponded] without publishing another message, even if
+// the first response failed to be sent.
 func (r *request) Respond(response []byte, opts ...RespondOpt) error {
+	if err := r.claimResponse(); err != nil {
+		return err
+	}
 	respMsg := &nats.Msg{
 		Data: response,
 	}
@@ -110,8 +130,8 @@ func (r *request) Respond(response []byte, opts ...RespondOpt) error {
 	}
 
 	if err := r.msg.RespondMsg(respMsg); err != nil {
-		r.respondError = fmt.Errorf("%w: %s", ErrRespond, err)
-		return r.respondError
+		r.setRespondError(fmt.Errorf("%w: %s", ErrRespond, err))
+		return r.responseError()
 	}
 
 	return nil
@@ -119,6 +139,9 @@ func (r *request) Respond(response []byte, opts ...RespondOpt) error {
 
 // RespondJSON marshals the given response value and responds to the request.
 // Additional headers can be passed using [WithHeaders] option.
+//
+// As with [Request.Respond], only the first response for a request is
+// published; later calls return [ErrRequestAlreadyResponded].
 func (r *request) RespondJSON(response any, opts ...RespondOpt) error {
 	resp, err := json.Marshal(response)
 	if err != nil {
@@ -130,12 +153,18 @@ func (r *request) RespondJSON(response any, opts ...RespondOpt) error {
 // Error prepares and publishes error response from a handler.
 // A response error should be set containing an error code and description.
 // Optionally, data can be set as response payload.
+//
+// As with [Request.Respond], only the first response for a request is
+// published; later calls return [ErrRequestAlreadyResponded].
 func (r *request) Error(code, description string, data []byte, opts ...RespondOpt) error {
 	if code == "" {
 		return fmt.Errorf("%w: error code", ErrArgRequired)
 	}
 	if description == "" {
 		return fmt.Errorf("%w: description", ErrArgRequired)
+	}
+	if err := r.claimResponse(); err != nil {
+		return err
 	}
 	response := &nats.Msg{
 		Header: nats.Header{
@@ -149,15 +178,42 @@ func (r *request) Error(code, description string, data []byte, opts ...RespondOp
 
 	response.Data = data
 	if err := r.msg.RespondMsg(response); err != nil {
-		r.respondError = err
-		return err
+		r.setRespondError(err)
+		return r.responseError()
 	}
-	r.respondError = &serviceError{
+	r.setRespondError(&serviceError{
 		Code:        code,
 		Description: description,
-	}
+	})
 
 	return nil
+}
+
+// claimResponse marks the request as responded to. It must be called before
+// publishing any response and returns [ErrRequestAlreadyResponded] when the
+// response was already claimed.
+func (r *request) claimResponse() error {
+	r.respMu.Lock()
+	defer r.respMu.Unlock()
+	if r.responded {
+		return ErrRequestAlreadyResponded
+	}
+	r.responded = true
+	return nil
+}
+
+func (r *request) setRespondError(err error) {
+	r.respMu.Lock()
+	r.respondError = err
+	r.respMu.Unlock()
+}
+
+// responseError returns the error recorded while sending the request's
+// response, if any.
+func (r *request) responseError() error {
+	r.respMu.Lock()
+	defer r.respMu.Unlock()
+	return r.respondError
 }
 
 // WithHeaders can be used to configure response with custom headers.

@@ -14,6 +14,7 @@
 package micro
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -203,6 +204,15 @@ type (
 		// async errors on the service's subscriptions, such as a slow consumer.
 		// The service keeps running; call Stop from the handler to stop it.
 		ErrorHandler ErrHandler
+
+		// DrainTimeout bounds how long Stop waits for requests that were
+		// accepted before the service stopped to finish. Stop first removes
+		// interest, so no new requests are accepted, then waits for the
+		// in-flight handlers to complete. A zero value waits without a
+		// deadline; when the deadline expires Stop returns
+		// [ErrServiceDrainTimeout], leaves the service in the stopping state
+		// and can be called again to keep waiting.
+		DrainTimeout time.Duration
 	}
 
 	EndpointConfig struct {
@@ -244,9 +254,32 @@ type (
 		verbSubs  map[string]*nats.Subscription
 		started   time.Time
 		nc        *nats.Conn
-		stopped   bool
+		// stopping is set when Stop begins tearing the service down: no new
+		// endpoints can be added once it is set. stopped is set once the
+		// drain finished and the DoneHandler was queued.
+		stopping bool
+		stopped  bool
+
+		// stopMu serializes Stop calls, including retries after a drain
+		// timeout and the Stop issued by the connection's closed handler.
+		stopMu sync.Mutex
+
+		// inFlight tracks requests whose handler is currently running. Stop
+		// waits for it to reach zero before queueing the DoneHandler, so the
+		// DoneHandler can only run once every accepted request has converged.
+		inFlight inFlightTracker
 
 		asyncDispatcher asyncCallbacksHandler
+	}
+
+	// inFlightTracker counts running request handlers and lets Stop wait for
+	// the count to reach zero. A waiter registered while handlers are running is
+	// closed when the count next hits zero; registering when nothing is running
+	// completes immediately.
+	inFlightTracker struct {
+		mu      sync.Mutex
+		count   int
+		waiters []chan struct{}
 	}
 
 	asyncCallbacksHandler struct {
@@ -300,6 +333,14 @@ var (
 
 	// ErrServiceNameRequired is returned when attempting to generate control subject with ID but empty name
 	ErrServiceNameRequired = errors.New("service name is required to generate ID control subject")
+
+	// ErrServiceStopped is returned when an endpoint is added to a service
+	// that is stopping or already stopped.
+	ErrServiceStopped = errors.New("service is stopped")
+
+	// ErrServiceDrainTimeout is returned by [Service.Stop] when in-flight
+	// requests do not finish within Config.DrainTimeout.
+	ErrServiceDrainTimeout = errors.New("timed out waiting for in-flight requests to finish")
 )
 
 func (s Verb) String() string {
@@ -429,6 +470,12 @@ func addEndpoint(s *service, name, subject string, handler Handler, metadata map
 	if !subjectRegexp.MatchString(queueGroup) {
 		return fmt.Errorf("%w: invalid endpoint queue group", ErrConfigValidation)
 	}
+	s.m.Lock()
+	if s.stopping || s.stopped {
+		s.m.Unlock()
+		return ErrServiceStopped
+	}
+	s.m.Unlock()
 	endpoint := &Endpoint{
 		service: s,
 		EndpointConfig: EndpointConfig{
@@ -453,14 +500,14 @@ func addEndpoint(s *service, name, subject string, handler Handler, metadata map
 			subject,
 			queueGroup,
 			func(m *nats.Msg) {
-				s.reqHandler(endpoint, &request{msg: m})
+				s.dispatch(endpoint.Handler, &request{msg: m}, endpoint)
 			},
 		)
 	} else {
 		sub, err = s.nc.Subscribe(
 			subject,
 			func(m *nats.Msg) {
-				s.reqHandler(endpoint, &request{msg: m})
+				s.dispatch(endpoint.Handler, &request{msg: m}, endpoint)
 			},
 		)
 	}
@@ -476,6 +523,13 @@ func addEndpoint(s *service, name, subject string, handler Handler, metadata map
 	}
 
 	s.m.Lock()
+	// Stop may have started while the subscription was being created; do not
+	// attach an endpoint to a service that is already tearing down.
+	if s.stopping || s.stopped {
+		s.m.Unlock()
+		_ = sub.Drain()
+		return ErrServiceStopped
+	}
 	endpoint.subscription = sub
 	s.endpoints = append(s.endpoints, endpoint)
 	endpoint.stats = EndpointStats{
@@ -619,7 +673,7 @@ func (s *service) addInternalHandler(nc *nats.Conn, verb Verb, kind, id, name st
 	}
 
 	sub, err := nc.Subscribe(subj, func(msg *nats.Msg) {
-		handler(&request{msg: msg})
+		s.dispatch(handler, &request{msg: msg})
 	})
 	if err != nil {
 		if stopErr := s.Stop(); stopErr != nil {
@@ -633,59 +687,171 @@ func (s *service) addInternalHandler(nc *nats.Conn, verb Verb, kind, id, name st
 	return nil
 }
 
-// reqHandler invokes the service request handler and modifies service stats
-func (s *service) reqHandler(endpoint *Endpoint, req *request) {
+// dispatch runs a request handler while tracking it as in-flight, then
+// updates the endpoint statistics. Stop waits for every dispatched request
+// to return before invoking the DoneHandler, so an accepted request always
+// converges before the service is considered done.
+func (s *service) dispatch(handler Handler, req *request, endpoints ...*Endpoint) {
+	var endpoint *Endpoint
+	if len(endpoints) > 0 {
+		endpoint = endpoints[0]
+	}
+	s.inFlight.add()
+	defer s.inFlight.done()
+
 	start := time.Now()
-	endpoint.Handler.Handle(req)
+	handler.Handle(req)
+	if endpoint == nil {
+		return
+	}
 	s.m.Lock()
 	endpoint.stats.NumRequests++
 	endpoint.stats.ProcessingTime += time.Since(start)
 	avgProcessingTime := endpoint.stats.ProcessingTime.Nanoseconds() / int64(endpoint.stats.NumRequests)
 	endpoint.stats.AverageProcessingTime = time.Duration(avgProcessingTime)
 
-	if req.respondError != nil {
+	if err := req.responseError(); err != nil {
 		endpoint.stats.NumErrors++
-		endpoint.stats.LastError = req.respondError.Error()
+		endpoint.stats.LastError = err.Error()
 	}
 	s.m.Unlock()
 }
 
-// Stop drains the endpoint subscriptions and marks the service as stopped.
+// add marks one more handler as running.
+func (t *inFlightTracker) add() {
+	t.mu.Lock()
+	t.count++
+	t.mu.Unlock()
+}
+
+// done marks one running handler as finished, waking the waiters when no
+// handler is in flight anymore.
+func (t *inFlightTracker) done() {
+	t.mu.Lock()
+	t.count--
+	if t.count == 0 {
+		for _, w := range t.waiters {
+			close(w)
+		}
+		t.waiters = nil
+	}
+	t.mu.Unlock()
+}
+
+// beginWait opens a wait that completes when every running handler has
+// finished. It returns immediately when no handler is in flight.
+func (t *inFlightTracker) beginWait() <-chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ch := make(chan struct{})
+	if t.count == 0 {
+		close(ch)
+		return ch
+	}
+	t.waiters = append(t.waiters, ch)
+	return ch
+}
+
+// Stop stops accepting new requests, drains the endpoint subscriptions and
+// waits for every request accepted before the call to finish before marking
+// the service as stopped.
+//
+// The subscriptions are drained (or unsubscribed when the connection is
+// closed) first, so no new requests reach any handler once Stop returns
+// successfully. When Config.DrainTimeout is non-zero and the in-flight
+// requests do not finish in time, Stop returns [ErrServiceDrainTimeout]:
+// the service stays in the stopping state, interest remains removed, and
+// Stop can be called again to keep waiting.
+//
+// The DoneHandler, if configured, is invoked exactly once, only after all
+// in-flight requests have converged.
 func (s *service) Stop() error {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+
 	s.m.Lock()
-	defer s.m.Unlock()
 	if s.stopped {
+		s.m.Unlock()
 		return nil
 	}
+	// From the first Stop attempt on, new endpoints and requests are
+	// rejected even if the drain later times out and Stop has to be retried.
+	s.stopping = true
 	// make a copy of s.endpoints to range over in order to stop
 	// since *Endpoint.stop manipulates s.endpoints!
 	endpointsToStop := append(make([]*Endpoint, 0, len(s.endpoints)), s.endpoints...)
+	verbSubs := make([]*nats.Subscription, 0, len(s.verbSubs))
+	for _, sub := range s.verbSubs {
+		verbSubs = append(verbSubs, sub)
+	}
+	s.m.Unlock()
+
 	for _, e := range endpointsToStop {
 		if err := e.stop(); err != nil {
 			return err
 		}
 	}
-	var keys []string
-	for key, sub := range s.verbSubs {
-		keys = append(keys, key)
-		if err := sub.Drain(); err != nil {
-			// connection is closed so draining is not possible
-			if errors.Is(err, nats.ErrConnectionClosed) {
-				break
-			}
+	for _, sub := range verbSubs {
+		if err := sub.Drain(); err != nil && !errors.Is(err, nats.ErrConnectionClosed) {
 			return fmt.Errorf("draining subscription for subject %q: %w", sub.Subject, err)
 		}
 	}
-	for _, key := range keys {
-		delete(s.verbSubs, key)
+	s.m.Lock()
+	s.verbSubs = map[string]*nats.Subscription{}
+	s.m.Unlock()
+
+	// All interest is gone at this point; wait for the accepted requests to
+	// converge before committing stop. The connection completes each
+	// subscription drain once its callbacks have returned.
+	if err := s.waitForDrain(); err != nil {
+		return err
 	}
+
+	s.m.Lock()
 	unregisterService(s)
 	s.stopped = true
+	s.m.Unlock()
 	if s.DoneHandler != nil {
 		s.asyncDispatcher.push(func() { s.DoneHandler(s) })
 	}
 	s.asyncDispatcher.close()
 	return nil
+}
+
+// waitForDrain blocks until all in-flight request handlers have returned.
+// With a DrainTimeout it returns [ErrServiceDrainTimeout] once the deadline
+// expires; with a zero timeout it waits indefinitely. Each Stop attempt,
+// including a retry after a timeout, opens its own waiter, so a retry cannot
+// commit the stop while requests are still running.
+//
+// Interest on the subscriptions was already removed before this point, and
+// the connection finishes each subscription drain once its delivered
+// callbacks have returned — which is exactly the condition waited on here.
+// Waiting on the subscriptions themselves would deadlock: a draining
+// subscription's pending accounting is only settled on the next delivery
+// loop iteration, which never comes after the last message.
+//
+// When the connection is closed no response can be delivered anymore, so the
+// in-flight wait is skipped: waiting on handlers that cannot observe the
+// close would deadlock the closed callback and the DoneHandler.
+func (s *service) waitForDrain() error {
+	// When the connection is closed, in-flight handlers have no way to
+	// observe the close and responses cannot be delivered anymore.
+	if s.nc.IsClosed() {
+		return nil
+	}
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if s.Config.DrainTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, s.Config.DrainTimeout)
+		defer cancel()
+	}
+	select {
+	case <-s.inFlight.beginWait():
+		return nil
+	case <-ctx.Done():
+		return ErrServiceDrainTimeout
+	}
 }
 
 func (s *service) serviceIdentity() ServiceIdentity {
@@ -854,16 +1020,19 @@ func (e *Endpoint) stop() error {
 	if err := e.subscription.Drain(); err != nil && !errors.Is(err, nats.ErrConnectionClosed) {
 		return fmt.Errorf("draining subscription for request handler: %w", err)
 	}
-	for i := 0; i < len(e.service.endpoints); i++ {
-		if e.service.endpoints[i].Subject == e.Subject {
-			if i != len(e.service.endpoints)-1 {
-				e.service.endpoints = append(e.service.endpoints[:i], e.service.endpoints[i+1:]...)
+	s := e.service
+	s.m.Lock()
+	for i := 0; i < len(s.endpoints); i++ {
+		if s.endpoints[i].Subject == e.Subject {
+			if i != len(s.endpoints)-1 {
+				s.endpoints = append(s.endpoints[:i], s.endpoints[i+1:]...)
 			} else {
-				e.service.endpoints = e.service.endpoints[:i]
+				s.endpoints = s.endpoints[:i]
 			}
 			i++
 		}
 	}
+	s.m.Unlock()
 	return nil
 }
 
