@@ -75,6 +75,7 @@ func (nc *Conn) requestWithContext(ctx context.Context, subj string, hdr, data [
 		case <-ctx.Done():
 			nc.mu.Lock()
 			delete(nc.respMap, token)
+			delete(nc.respGens, token)
 			nc.mu.Unlock()
 			return nil, ctx.Err()
 		}

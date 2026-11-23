@@ -2099,3 +2099,107 @@ func TestFailedPlaintextAttemptKeepsInfo(t *testing.T) {
 		t.Fatalf("Error on publish: %v", err)
 	}
 }
+
+// TestReconnectGenerationFence verifies the generation-based state machine
+// end to end across several real disconnects:
+//   - each cycle publishes exactly one RECONNECTING then one CONNECTED event
+//     (a single current connection; stale goroutines/timers cannot trigger a
+//     second reconnect);
+//   - the internal generation is strictly increasing;
+//   - after every cycle publish, flush and request all work again on the new
+//     connection;
+//   - a Close racing the last reconnect settles to a single CLOSED state.
+func TestReconnectGenerationFence(t *testing.T) {
+	withServerInstance(t, func(t *testing.T, _ *nats.Conn, inst *testservice.Instance) {
+		nc, err := nats.Connect(inst.Servers[0].URL,
+			nats.ReconnectWait(20*time.Millisecond),
+			nats.ReconnectJitter(0, 0),
+			nats.MaxReconnects(-1),
+			nats.PingInterval(50*time.Millisecond),
+		)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		defer nc.Close()
+
+		// A responder so requests work after every reconnect.
+		sub, err := nc.Subscribe("gen.echo", func(m *nats.Msg) {
+			_ = m.Respond(m.Data)
+		})
+		if err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
+		defer sub.Unsubscribe()
+
+		statusCh := nc.StatusChanged(nats.RECONNECTING, nats.CONNECTED)
+		defer nc.RemoveStatusListener(statusCh)
+
+		prevGen := nc.ConnGeneration()
+		if prevGen == 0 {
+			t.Fatal("initial generation should be non-zero once connected")
+		}
+
+		const cycles = 3
+		for i := 0; i < cycles; i++ {
+			inst.StopServer(t, inst.Servers[0])
+			WaitOnChannel(t, statusCh, nats.RECONNECTING)
+
+			inst.StartServer(t, inst.Servers[0])
+			WaitOnChannel(t, statusCh, nats.CONNECTED)
+
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				if !nc.IsConnected() {
+					return errors.New("not connected after restart")
+				}
+				return nil
+			})
+
+			gen := nc.ConnGeneration()
+			if gen <= prevGen {
+				t.Fatalf("cycle %d: generation did not increase: %d -> %d", i, prevGen, gen)
+			}
+			prevGen = gen
+
+			// The new connection must fully work: publish/flush round trip.
+			if err := nc.Publish("gen.pub", []byte("x")); err != nil {
+				t.Fatalf("cycle %d: publish after reconnect: %v", i, err)
+			}
+			if err := nc.Flush(); err != nil {
+				t.Fatalf("cycle %d: flush after reconnect: %v", i, err)
+			}
+			resp, err := nc.Request("gen.echo", []byte("ping"), time.Second)
+			if err != nil {
+				t.Fatalf("cycle %d: request after reconnect: %v", i, err)
+			}
+			if string(resp.Data) != "ping" {
+				t.Fatalf("cycle %d: unexpected response %q", i, resp.Data)
+			}
+		}
+
+		// No extra status events may be buffered: every RECONNECTING was paired
+		// with a CONNECTED. A stale timer or readLoop would have enqueued a
+		// spurious RECONNECTING here.
+		select {
+		case s := <-statusCh:
+			t.Fatalf("unexpected unpaired status event after settling: %v", s)
+		default:
+		}
+
+		// Concurrent Close must publish exactly one terminal connection.
+		var wg sync.WaitGroup
+		for range 5 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				nc.Close()
+			}()
+		}
+		wg.Wait()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if nc.Status() != nats.CLOSED {
+				return fmt.Errorf("status = %v, want CLOSED", nc.Status())
+			}
+			return nil
+		})
+	})
+}

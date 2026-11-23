@@ -698,10 +698,19 @@ type Conn struct {
 	ps            *parseState
 	ptmr          *time.Timer
 	pout          int
-	ar            bool // abort reconnect
-	rqch          chan struct{}
-	ws            bool // true if a websocket connection
-	awaitInfo     bool // wait for the INFO after the first PONG before connected
+	// generation identifies the current physical connection attempt. It is
+	// bumped by one on every processConnectInit() call (each real socket
+	// attempt, including failed ones). Async artifacts (ping timer callback,
+	// readLoop/flusher, in-flight requests) snapshot the generation when they
+	// are created and fence themselves against it before touching the current
+	// connection, so an artifact of a previous generation can only finish with
+	// that generation's terminal state and never act on a newer connection.
+	// Always accessed under mu.
+	generation uint64
+	ar         bool // abort reconnect
+	rqch       chan struct{}
+	ws         bool // true if a websocket connection
+	awaitInfo  bool // wait for the INFO after the first PONG before connected
 	// tlsReason says what made the client ask for TLS.
 	tlsReason string
 
@@ -711,7 +720,12 @@ type Conn struct {
 	respSubLen    int                  // the length of the wildcard prefix excluding trailing .
 	respMux       *Subscription        // A single response subscription
 	respMap       map[string]chan *Msg // Request map for the response msg channels
-	respRand      *rand.Rand           // Used for generating suffix
+	// respGens records the generation in which each entry of respMap was
+	// registered. It follows respMap's lifecycle and key set exactly; it never
+	// drives delivery or replay decisions, only generation ownership and
+	// (test) verification. Always accessed under mu.
+	respGens map[string]uint64
+	respRand *rand.Rand // Used for generating suffix
 
 	// Msg filters for testing.
 	// Protected by subsMu
@@ -2706,22 +2720,14 @@ func (nc *Conn) ForceReconnect() error {
 		return nil
 	}
 
-	// Clear any queued pongs
-	nc.clearPendingFlushCalls()
-
-	// Clear any queued and blocking requests.
-	nc.clearPendingRequestCalls()
-
-	// Stop ping timer if set.
-	nc.stopPingTimer()
-
-	// flush any pending data and switch to pending mode to buffer new outgoing
-	// data until we reconnect and can flush it.
+	// Flush any buffered data first; beginReconnect then closes the socket
+	// and switches the writer to pending mode so new outgoing data is buffered
+	// until we reconnect and can flush it.
 	nc.bw.flush()
-	nc.bw.switchToPending()
-	nc.conn.Close()
 
-	nc.changeConnStatus(RECONNECTING)
+	// ForceReconnect explicitly interrupts in-flight requests: they end with
+	// ErrDisconnected on the old generation rather than being replayed.
+	nc.beginReconnect(true)
 	go nc.doReconnect(nil, true)
 	return nil
 }
@@ -2990,6 +2996,13 @@ func (nc *Conn) processConnectInit() error {
 	nc.conn.SetDeadline(time.Now().Add(nc.Opts.Timeout))
 	defer nc.conn.SetDeadline(time.Time{})
 
+	// Every physical connection attempt starts a new generation. Artifacts of
+	// previous attempts (timers, goroutines, pong waiters) keep their own
+	// snapshot and are fenced off once this is bumped, so a failed attempt is
+	// fully rolled back and can never affect the next attempt.
+	nc.generation++
+	gen := nc.generation
+
 	// Set our status to connecting.
 	nc.changeConnStatus(CONNECTING)
 
@@ -3026,19 +3039,24 @@ func (nc *Conn) processConnectInit() error {
 	// Reset the number of PING sent out
 	nc.pout = 0
 
-	// Start or reset Timer
+	// Start a fresh ping timer bound to this generation. We deliberately do
+	// not reuse a previous timer: the AfterFunc callback cannot be rebinding
+	// after creation, so a reused timer would keep the old generation's
+	// closure. A stale callback that slips past Stop() is then a no-op thanks
+	// to the generation fence inside the closure.
 	if nc.Opts.PingInterval > 0 {
-		if nc.ptmr == nil {
-			nc.ptmr = time.AfterFunc(nc.Opts.PingInterval, nc.processPingTimer)
-		} else {
-			nc.ptmr.Reset(nc.Opts.PingInterval)
-		}
+		nc.stopPingTimer()
+		nc.ptmr = time.AfterFunc(nc.Opts.PingInterval, func() {
+			nc.processPingTimer(gen)
+		})
 	}
 
 	// Start the readLoop and flusher go routines, we will wait on both on a reconnect event.
+	// Each snapshots the current generation so that, after a reconnect, the
+	// previous generation's goroutines cannot act on the new connection.
 	nc.wg.Add(2)
-	go nc.readLoop()
-	go nc.flusher()
+	go nc.readLoop(gen)
+	go nc.flusher(gen)
 
 	// Notify the reader that we are done with the connect handshake, where
 	// reads were done synchronously and under the connection lock.
@@ -3516,6 +3534,43 @@ func (nc *Conn) stopPingTimer() {
 	}
 }
 
+// isCurrentGeneration reports whether gen is the generation of the connection
+// currently in use. Async artifacts use this as a fence: a stale artifact whose
+// generation no longer matches must not touch the current connection.
+// Connection lock is held on entry.
+func (nc *Conn) isCurrentGeneration(gen uint64) bool {
+	return gen == nc.generation
+}
+
+// beginReconnect performs the rollable transition from a connected (or
+// connecting) generation into the RECONNECTING state and invalidates every
+// async artifact owned by the outgoing generation:
+//   - the ping timer is stopped, so a late timer callback gets fenced by the
+//     generation captured in its closure rather than acting on the new socket;
+//   - pending flush callers (pongs) are failed with ErrConnectionClosed;
+//   - the writer switches to its pending buffer, so only bytes not yet written
+//     to the old socket can be sent to the next connection;
+//   - when failRequests is true, in-flight requests are failed with
+//     ErrDisconnected (used by ForceReconnect, whose contract explicitly
+//     interrupts them). Natural reconnects keep them registered: a request
+//     written to the old socket is never silently replayed, and a response is
+//     still delivered if the server can route one.
+//
+// Connection lock is held on entry.
+func (nc *Conn) beginReconnect(failRequests bool) {
+	nc.changeConnStatus(RECONNECTING)
+	nc.stopPingTimer()
+	if nc.conn != nil {
+		nc.conn.Close()
+		nc.conn = nil
+	}
+	nc.bw.switchToPending()
+	nc.clearPendingFlushCalls()
+	if failRequests {
+		nc.clearPendingRequestCalls()
+	}
+}
+
 // Try to reconnect using the option parameters.
 // This function assumes we are allowed to reconnect.
 func (nc *Conn) doReconnect(err error, forceReconnect bool) {
@@ -3810,28 +3865,29 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 // The lock should not be held entering this function. If forceReconnect
 // is true, the first reconnect attempt will bypass the configured
 // ReconnectWait; subsequent attempts still obey the normal backoff.
-func (nc *Conn) processOpErr(err error, forceReconnect bool) bool {
+//
+// gen is the connection generation of the caller (readLoop/flusher/ping
+// timer). A non-zero gen that no longer matches the current connection
+// identifies an error from an already-superseded generation: the current
+// connection owns the recovery decision, so this call is a no-op. Parser
+// driven paths that are not generation scoped pass 0 and rely on the status
+// guards below.
+func (nc *Conn) processOpErr(err error, forceReconnect bool, gen uint64) bool {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
+	if gen != 0 && !nc.isCurrentGeneration(gen) {
+		return false
+	}
 	if nc.isConnecting() || nc.isClosed() || nc.isReconnecting() {
 		return false
 	}
 
 	if nc.Opts.AllowReconnect && nc.status == CONNECTED {
-		// Set our new status
-		nc.changeConnStatus(RECONNECTING)
-		// Stop ping timer if set
-		nc.stopPingTimer()
-		if nc.conn != nil {
-			nc.conn.Close()
-			nc.conn = nil
-		}
-
-		// Create pending buffer before reconnecting.
-		nc.bw.switchToPending()
-
-		// Clear any queued pongs, e.g. pending flush calls.
-		nc.clearPendingFlushCalls()
+		// Roll the connection into RECONNECTING and invalidate every artifact
+		// of the outgoing generation. In-flight requests are kept: bytes
+		// already written to the old socket are not replayed, and a response
+		// is still delivered if the server can route one.
+		nc.beginReconnect(false)
 
 		go nc.doReconnect(err, forceReconnect)
 		return false
@@ -3905,8 +3961,8 @@ func (ac *asyncCallbacksHandler) pushOrClose(f func(), close bool) {
 
 // readLoop() will sit on the socket reading and processing the
 // protocol from the server. It will dispatch appropriately based
-// on the op type.
-func (nc *Conn) readLoop() {
+// on the op type. gen is the generation owning this read loop.
+func (nc *Conn) readLoop(gen uint64) {
 	// Release the wait group on exit
 	defer nc.wg.Done()
 
@@ -3942,7 +3998,10 @@ func (nc *Conn) readLoop() {
 				err = nc.bw.partialWriteErr
 			}
 			nc.mu.Unlock()
-			if shouldClose := nc.processOpErr(err, false); shouldClose {
+			// A read loop from a previous generation is already disconnected:
+			// its error belongs to that generation and must not start a
+			// reconnect against the current connection.
+			if shouldClose := nc.processOpErr(err, false, gen); shouldClose {
 				nc.close(CLOSED, true, nil)
 			}
 			break
@@ -4387,7 +4446,7 @@ func (nc *Conn) processAuthError(err error) bool {
 
 // flusher is a separate Go routine that will process flush requests for the write
 // bufio. This allows coalescing of writes to the underlying socket.
-func (nc *Conn) flusher() {
+func (nc *Conn) flusher(gen uint64) {
 	// Release the wait group
 	defer nc.wg.Done()
 
@@ -4408,8 +4467,10 @@ func (nc *Conn) flusher() {
 		}
 		nc.mu.Lock()
 
-		// Check to see if we should bail out.
-		if !nc.isConnected() || nc.isConnecting() || conn != nc.conn {
+		// Check to see if we should bail out. The generation fence is the
+		// primary identity check: a flusher started by a previous connection
+		// must never write to, or raise errors against, the current one.
+		if !nc.isCurrentGeneration(gen) || !nc.isConnected() || nc.isConnecting() || conn != nc.conn {
 			nc.mu.Unlock()
 			return
 		}
@@ -4423,7 +4484,7 @@ func (nc *Conn) flusher() {
 				}
 				if nc.Opts.ReconnectOnFlusherError {
 					nc.mu.Unlock()
-					if shouldClose := nc.processOpErr(err, true); shouldClose {
+					if shouldClose := nc.processOpErr(err, true, gen); shouldClose {
 						nc.close(CLOSED, true, nil)
 					}
 					return
@@ -4633,14 +4694,17 @@ func (nc *Conn) processErr(ie string) {
 	var close bool
 
 	// FIXME(dlc) - process Slow Consumer signals special.
+	// These errors are delivered through the parser without a generation
+	// scope; the status guards in processOpErr ensure a superseded connection
+	// cannot trigger a second reconnect.
 	if e == STALE_CONNECTION {
-		close = nc.processOpErr(ErrStaleConnection, false)
+		close = nc.processOpErr(ErrStaleConnection, false, 0)
 	} else if e == MAX_CONNECTIONS_ERR {
-		close = nc.processOpErr(ErrMaxConnectionsExceeded, false)
+		close = nc.processOpErr(ErrMaxConnectionsExceeded, false, 0)
 	} else if e == MAX_ACCOUNT_CONNECTIONS_ERR {
-		close = nc.processOpErr(ErrMaxAccountConnectionsExceeded, false)
+		close = nc.processOpErr(ErrMaxAccountConnectionsExceeded, false, 0)
 	} else if e == unknownProtoOpErr {
-		close = nc.processOpErr(errors.New("nats: "+ne), false)
+		close = nc.processOpErr(errors.New("nats: "+ne), false, 0)
 	} else if e == maxControlLineErr {
 		close = true
 		err := errors.New("nats: " + ne)
@@ -5050,6 +5114,7 @@ func (nc *Conn) respHandler(m *Msg) {
 		mch = nc.respMap[rt]
 		// Delete the key regardless, one response only.
 		delete(nc.respMap, rt)
+		delete(nc.respGens, rt)
 	} else if len(nc.respMap) == 1 {
 		// If the server has rewritten the subject, the response token (rt)
 		// will not match (could be the case with JetStream). If that is the
@@ -5057,6 +5122,7 @@ func (nc *Conn) respHandler(m *Msg) {
 		for k, v := range nc.respMap {
 			mch = v
 			delete(nc.respMap, k)
+			delete(nc.respGens, k)
 			break
 		}
 	}
@@ -5081,6 +5147,13 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 	token := respInbox[nc.respSubLen:]
 
 	nc.respMap[token] = mch
+	// Record the generation owning this request. The request is not replayed
+	// on a later connection; the generation only states which connection its
+	// terminal state (response, timeout, or explicit failure) belongs to.
+	if nc.respGens == nil {
+		nc.respGens = make(map[string]uint64)
+	}
+	nc.respGens[token] = nc.generation
 	if nc.respMux == nil {
 		// Create the response subscription we will use for all new style responses.
 		// This will be on an _INBOX with an additional terminal token. The subscription
@@ -5172,6 +5245,7 @@ func (nc *Conn) newRequest(subj string, hdr, data []byte, timeout time.Duration)
 	case <-t.C:
 		nc.mu.Lock()
 		delete(nc.respMap, token)
+		delete(nc.respGens, token)
 		nc.mu.Unlock()
 		return nil, ErrTimeout
 	}
@@ -5242,6 +5316,7 @@ func (nc *Conn) initNewResp() {
 	nc.respSubLen = len(nc.respSubPrefix)
 	nc.respSub = fmt.Sprintf("%s*", nc.respSubPrefix)
 	nc.respMap = make(map[string]chan *Msg)
+	nc.respGens = make(map[string]uint64)
 	nc.respRand = rand.New(rand.NewSource(time.Now().UnixNano()))
 }
 
@@ -6281,9 +6356,20 @@ func (nc *Conn) sendPing(ch chan struct{}) {
 
 // This will fire periodically and send a client origin
 // ping to the server. Will also check that we have received
-// responses from the server.
-func (nc *Conn) processPingTimer() {
+// responses from the server. gen is the connection generation
+// captured when the timer was created; a callback from a timer
+// owned by a previous generation is fenced and does nothing.
+func (nc *Conn) processPingTimer(gen uint64) {
 	nc.mu.Lock()
+
+	// Fence: a reconnect (or a failed connect attempt followed by another
+	// one) has bumped the generation. This timer belongs to a connection that
+	// is gone, so it must not ping the new socket, mutate the new pout
+	// counter, or raise a stale-connection error against it.
+	if !nc.isCurrentGeneration(gen) {
+		nc.mu.Unlock()
+		return
+	}
 
 	if nc.status != CONNECTED {
 		nc.mu.Unlock()
@@ -6294,14 +6380,20 @@ func (nc *Conn) processPingTimer() {
 	nc.pout++
 	if nc.pout > nc.Opts.MaxPingsOut {
 		nc.mu.Unlock()
-		if shouldClose := nc.processOpErr(ErrStaleConnection, false); shouldClose {
+		if shouldClose := nc.processOpErr(ErrStaleConnection, false, gen); shouldClose {
 			nc.close(CLOSED, true, nil)
 		}
 		return
 	}
 
 	nc.sendPing(nil)
-	nc.ptmr.Reset(nc.Opts.PingInterval)
+	// The timer is still the current generation's here (close() that nils
+	// ptmr is mutually exclusive with this block on mu), so resetting it
+	// keeps the same fenced closure for the next period. Guard anyway so a
+	// future caller that breaks the invariant cannot panic.
+	if nc.ptmr != nil {
+		nc.ptmr.Reset(nc.Opts.PingInterval)
+	}
 	nc.mu.Unlock()
 }
 
@@ -6442,6 +6534,7 @@ func (nc *Conn) clearPendingRequestCalls() {
 			close(ch)
 			delete(nc.respMap, key)
 		}
+		delete(nc.respGens, key)
 	}
 }
 

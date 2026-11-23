@@ -56,3 +56,40 @@ func (nc *Conn) CloseTCPConn() {
 	defer nc.mu.Unlock()
 	nc.conn.Close()
 }
+
+// ConnGeneration returns the current connection generation. The generation is
+// bumped on every physical connection attempt, so it is strictly increasing
+// across reconnects. Used to verify that async artifacts from a previous
+// generation cannot act on the current connection.
+func (nc *Conn) ConnGeneration() uint64 {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	return nc.generation
+}
+
+// ConnPingTimerActive reports whether the connection currently has a ping
+// timer scheduled. Used to verify that reconnect starts a fresh timer rather
+// than reusing the previous generation's one.
+func (nc *Conn) ConnPingTimerActive() bool {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	return nc.ptmr != nil
+}
+
+// InflightRequestGeneration returns the generation in which the in-flight
+// request keyed by token was registered. The boolean is false when no such
+// request exists.
+func (nc *Conn) InflightRequestGeneration(token string) (uint64, bool) {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	gen, ok := nc.respGens[token]
+	return gen, ok
+}
+
+// NumInflightRequests returns the number of currently registered new-style
+// requests and their generation entries. The two maps must always agree.
+func (nc *Conn) NumInflightRequests() int {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	return len(nc.respMap)
+}
