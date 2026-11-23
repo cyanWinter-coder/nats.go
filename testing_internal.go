@@ -56,3 +56,52 @@ func (nc *Conn) CloseTCPConn() {
 	defer nc.mu.Unlock()
 	nc.conn.Close()
 }
+
+// FairDispatchEnabled reports whether the connection was created with the
+// FairDispatch option and therefore delivers async subscriptions through the
+// per-connection bounded round-robin dispatcher.
+func (nc *Conn) FairDispatchEnabled() bool {
+	return nc.fd != nil
+}
+
+// WaitForFairDispatchShutdown blocks until the fair dispatcher's worker pool
+// has fully exited after the connection was closed. It is intended for tests
+// that need to assert on work completed by the dispatcher; ordinary code
+// should rely on the closed handler instead. It must not be called from a
+// message handler. It is a no-op without fair dispatch.
+func (nc *Conn) WaitForFairDispatchShutdown() {
+	if nc.fd == nil {
+		return
+	}
+	nc.fd.waitForShutdown()
+}
+
+// SetFairDispatchTurnHooks installs callbacks invoked at the start and end of
+// every fair dispatcher turn for the given subscription. Either hook may be
+// nil. They run on the dispatcher goroutine and must not block indefinitely.
+// It is a no-op on connections without fair dispatch.
+func (nc *Conn) SetFairDispatchTurnHooks(onStart, onDone func(*Subscription)) {
+	if nc.fd == nil {
+		return
+	}
+	nc.fd.mu.Lock()
+	defer nc.fd.mu.Unlock()
+	nc.fd.onTurnStart = onStart
+	nc.fd.onTurnDone = onDone
+}
+
+// FairDispatchRingSnapshot returns the subjects of the subscriptions currently
+// scheduled in the fair dispatcher's round-robin ring, in scheduling order.
+// It is intended for deterministic assertions in tests.
+func (nc *Conn) FairDispatchRingSnapshot() []string {
+	if nc.fd == nil {
+		return nil
+	}
+	nc.fd.mu.Lock()
+	defer nc.fd.mu.Unlock()
+	out := make([]string, 0, len(nc.fd.ring))
+	for _, s := range nc.fd.ring {
+		out = append(out, s.Subject)
+	}
+	return out
+}

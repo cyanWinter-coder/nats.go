@@ -106,17 +106,24 @@ const (
 
 // Errors
 var (
-	ErrConnectionClosed              = errors.New("nats: connection closed")
-	ErrConnectionDraining            = errors.New("nats: connection draining")
-	ErrDrainTimeout                  = errors.New("nats: draining connection timed out")
-	ErrConnectionReconnecting        = errors.New("nats: connection reconnecting")
-	ErrSecureConnRequired            = errors.New("nats: secure connection required")
-	ErrSecureConnWanted              = errors.New("nats: secure connection not available")
-	ErrBadSubscription               = errors.New("nats: invalid subscription")
-	ErrTypeSubscription              = errors.New("nats: invalid subscription type")
-	ErrBadSubject                    = errors.New("nats: invalid subject")
-	ErrBadQueueName                  = errors.New("nats: invalid queue name")
-	ErrSlowConsumer                  = errors.New("nats: slow consumer, messages dropped")
+	ErrConnectionClosed       = errors.New("nats: connection closed")
+	ErrConnectionDraining     = errors.New("nats: connection draining")
+	ErrDrainTimeout           = errors.New("nats: draining connection timed out")
+	ErrConnectionReconnecting = errors.New("nats: connection reconnecting")
+	ErrSecureConnRequired     = errors.New("nats: secure connection required")
+	ErrSecureConnWanted       = errors.New("nats: secure connection not available")
+	ErrBadSubscription        = errors.New("nats: invalid subscription")
+	ErrTypeSubscription       = errors.New("nats: invalid subscription type")
+	ErrBadSubject             = errors.New("nats: invalid subject")
+	ErrBadQueueName           = errors.New("nats: invalid queue name")
+	ErrSlowConsumer           = errors.New("nats: slow consumer, messages dropped")
+	// ErrSubscriptionQueueFull is reported to the asynchronous error callback
+	// when a fair-dispatch subscription's per-subscription bounded pending
+	// queue is full. The offending subscription is isolated and the message
+	// is dropped, but the connection's dispatcher keeps advancing every other
+	// subscription. It wraps ErrSlowConsumer so existing slow-consumer
+	// handling keeps matching.
+	ErrSubscriptionQueueFull         = fmt.Errorf("%w: subscription pending queue full, subscription isolated", ErrSlowConsumer)
 	ErrTimeout                       = errors.New("nats: timeout")
 	ErrBadTimeout                    = errors.New("nats: timeout invalid")
 	ErrAuthorization                 = errors.New("nats: authorization violation")
@@ -631,6 +638,35 @@ type Options struct {
 	// can be lost on blocked writes but may significantly reduce throughput.
 	// Defaults to 32768 bytes (32KB).
 	WriteBufferSize int
+
+	// FairDispatch enables a single per-connection bounded round-robin
+	// dispatcher for asynchronous subscriptions. Each async subscription
+	// owns a bounded pending queue (configured with SetPendingLimits) and
+	// the dispatcher advances subscriptions in fair round-robin order,
+	// delivering at most FairDispatchQuantum messages per turn. A
+	// subscription whose queue is full is isolated in place (the message is
+	// dropped and ErrSubscriptionQueueFull, which wraps ErrSlowConsumer, is
+	// delivered to the asynchronous error callback) without stalling delivery
+	// to any other subscription or to the connection's protocol/heartbeat
+	// handling. Sync and channel subscriptions are unaffected. When false
+	// (the default), every async subscription runs on its own delivery
+	// goroutine, preserving the historical behavior.
+	FairDispatch bool
+
+	// FairDispatchQuantum bounds how many messages a single subscription may
+	// deliver during one dispatcher turn before the dispatcher rotates to the
+	// next ready subscription. A value <= 0 means the library default is used.
+	// Only meaningful when FairDispatch is enabled.
+	FairDispatchQuantum int
+
+	// FairDispatchWorkers sets the size of the fixed worker pool that runs
+	// asynchronous subscription callbacks under fair dispatch. At most one
+	// callback per subscription is ever in flight, so this bounds how many
+	// subscriptions can process callbacks concurrently; a blocked callback on
+	// one subscription never stalls the others as long as more than one worker
+	// is configured. A value <= 0 means the library default (a small multiple
+	// of GOMAXPROCS, capped). Only meaningful when FairDispatch is enabled.
+	FairDispatchWorkers int
 }
 
 const (
@@ -716,6 +752,11 @@ type Conn struct {
 	// Msg filters for testing.
 	// Protected by subsMu
 	filters map[string]msgFilter
+
+	// fd is the per-connection fair dispatcher, present only when the
+	// connection was created with the FairDispatch option. It owns delivery of
+	// messages to asynchronous subscriptions in bounded round-robin turns.
+	fd *fairDispatcher
 }
 
 type natsReader struct {
@@ -791,6 +832,21 @@ type Subscription struct {
 	pMsgsLimit  int
 	pBytesLimit int
 	dropped     int
+
+	// terminalDone is used only by the fair dispatcher to record that the
+	// subscription's one-time terminal cleanup (queue drain plus the closed
+	// handler) has run, so the cleanup can never be released twice.
+	terminalDone bool
+
+	// fdInflight is used only by the fair dispatcher: true while a worker
+	// owns a turn for this subscription, guaranteeing at most one callback
+	// per subscription is ever in flight (strict per-subscription FIFO).
+	// fdClosing records that the subscription has been closed while a turn
+	// was in flight, so the worker must keep draining it and then run its
+	// one-time terminal cleanup. Both are protected by the fair dispatcher
+	// mutex.
+	fdInflight bool
+	fdClosing  bool
 }
 
 // Status represents the state of the connection.
@@ -1411,6 +1467,54 @@ func ReconnectBufSize(size int) Option {
 func WriteBufferSize(size int) Option {
 	return func(o *Options) error {
 		o.WriteBufferSize = size
+		return nil
+	}
+}
+
+// FairDispatch enables a per-connection bounded round-robin dispatcher for
+// asynchronous subscriptions. Instead of starting one delivery goroutine per
+// async subscription, a single dispatcher owns delivery and rotates across
+// subscriptions in fair round-robin order. Every subscription keeps its own
+// bounded pending queue (SetPendingLimits); when a queue is full the
+// subscription is isolated and the message is dropped with
+// ErrSubscriptionQueueFull (wrapping ErrSlowConsumer) reported through the
+// asynchronous error callback, while delivery to every other subscription and
+// the connection's heartbeat/protocol handling continues unaffected.
+//
+// Sync subscriptions (SubscribeSync and the Msgs iterators) and channel
+// subscriptions (ChanSubscribe) are unchanged and keep their historical
+// delivery semantics and per-subscription message ordering.
+func FairDispatch() Option {
+	return func(o *Options) error {
+		o.FairDispatch = true
+		return nil
+	}
+}
+
+// FairDispatchQuantum sets the maximum number of messages that a single
+// subscription may deliver during one turn of the fair dispatcher before it
+// rotates to the next ready subscription. Lower values trade throughput for
+// tighter fairness between subscriptions. It has no effect without
+// FairDispatch and values <= 0 select the library default.
+func FairDispatchQuantum(quantum int) Option {
+	return func(o *Options) error {
+		if quantum < 0 {
+			return ErrInvalidArg
+		}
+		o.FairDispatchQuantum = quantum
+		return nil
+	}
+}
+
+// FairDispatchWorkers sets the size of the fixed worker pool that runs
+// asynchronous subscription callbacks when FairDispatch is enabled. A value
+// <= 0 selects the library default. It has no effect without FairDispatch.
+func FairDispatchWorkers(workers int) Option {
+	return func(o *Options) error {
+		if workers < 0 {
+			return ErrInvalidArg
+		}
+		o.FairDispatchWorkers = workers
 		return nil
 	}
 }
@@ -2070,6 +2174,12 @@ func (o Options) Connect() (*Conn, error) {
 	nc.ach = &asyncCallbacksHandler{}
 	nc.ach.cond = sync.NewCond(&nc.ach.mu)
 
+	// Start the fair dispatcher before connect, mirroring the async callback
+	// handler, so it is ready to deliver as soon as subscriptions exist.
+	if nc.Opts.FairDispatch {
+		nc.fd = newFairDispatcher(nc, nc.Opts.FairDispatchQuantum, nc.Opts.FairDispatchWorkers)
+	}
+
 	// Set a default error handler that will print to stderr.
 	if nc.Opts.AsyncErrorCB == nil {
 		nc.Opts.AsyncErrorCB = defaultErrHandler
@@ -2086,6 +2196,10 @@ func (o Options) Connect() (*Conn, error) {
 	connectionEstablished, err := nc.connect()
 	if err != nil {
 		nc.ach.close()
+		if nc.fd != nil {
+			nc.fd.shutdown()
+			nc.fd = nil
+		}
 		return nil, err
 	}
 
@@ -4208,8 +4322,13 @@ func (nc *Conn) processMsg(data []byte) {
 				goto slowConsumer
 			}
 		} else {
-			// Push onto the async pList
-			if sub.pHead == nil {
+			// Push onto the async pList. Under fair dispatch the per-connection
+			// dispatcher owns scheduling and adds the subscription to its
+			// bounded round-robin ring; otherwise the subscription's own
+			// waitForMsgs goroutine is signaled directly.
+			if nc.fd != nil {
+				nc.fd.enqueueLocked(sub, m)
+			} else if sub.pHead == nil {
 				sub.pHead = m
 				sub.pTail = m
 				if sub.pCond != nil {
@@ -4293,6 +4412,13 @@ slowConsumer:
 	sub.sc = true
 	// Undo stats from above
 	sub.releaseReserved(m)
+	// Under fair dispatch a full per-subscription queue isolates only that
+	// subscription; surface the identifiable queue-full error while keeping it
+	// recognizable as a slow consumer (it wraps ErrSlowConsumer).
+	slowConsumerErr := ErrSlowConsumer
+	if nc.fd != nil {
+		slowConsumerErr = ErrSubscriptionQueueFull
+	}
 	if sc {
 		sub.changeSubStatus(SubscriptionSlowConsumer)
 		sub.mu.Unlock()
@@ -4302,7 +4428,7 @@ slowConsumer:
 		nc.mu.Lock()
 		nc.err = ErrSlowConsumer
 		if asyncErrorCB := nc.Opts.AsyncErrorCB; asyncErrorCB != nil {
-			nc.ach.push(func() { asyncErrorCB(nc, sub, ErrSlowConsumer) })
+			nc.ach.push(func() { asyncErrorCB(nc, sub, slowConsumerErr) })
 		}
 		nc.mu.Unlock()
 	} else {
@@ -5433,7 +5559,10 @@ func (nc *Conn) subscribeLocked(subj, queue string, cb MsgHandler, ch chan *Msg,
 	if cb != nil {
 		sub.typ = AsyncSubscription
 		sub.pCond = sync.NewCond(&sub.mu)
-		sr = true
+		// Under the fair dispatcher a single per-connection goroutine
+		// delivers for every async subscription, so no per-subscription
+		// waitForMsgs goroutine is started here.
+		sr = nc.fd == nil
 	} else if !isSync {
 		sub.typ = ChanSubscription
 		sub.mch = ch
@@ -5509,6 +5638,12 @@ func (nc *Conn) removeSub(s *Subscription) {
 	s.changeSubStatus(SubscriptionClosed)
 	if s.pCond != nil {
 		s.pCond.Broadcast()
+	}
+	// Under fair dispatch, async subscriptions have no waitForMsgs goroutine.
+	// Schedule their one-time final turn so the dispatcher drains any messages
+	// already dequeued in order and runs the closed handler exactly once.
+	if s.typ == AsyncSubscription && nc.fd != nil && !s.terminalDone {
+		nc.fd.scheduleLocked(s)
 	}
 }
 
@@ -6513,8 +6648,16 @@ func (nc *Conn) close(status Status, doCBs bool, err error) {
 		s.closed = true
 		// Mark connection closed in subscription
 		s.connClosed = true
-		// If we have an async subscription, signals it to exit
-		if s.typ == AsyncSubscription && s.pCond != nil {
+		if nc.fd != nil {
+			// Fair dispatch: guarantee a final draining/cleanup turn. The
+			// dispatcher will stop starting new callbacks, complete any
+			// in-flight callback, and run the closed handler exactly once
+			// after the remaining queue is processed in order.
+			if s.typ == AsyncSubscription && !s.terminalDone {
+				nc.fd.scheduleLocked(s)
+			}
+		} else if s.typ == AsyncSubscription && s.pCond != nil {
+			// Legacy per-subscription delivery goroutine.
 			s.pCond.Signal()
 		}
 
@@ -6549,6 +6692,18 @@ func (nc *Conn) close(status Status, doCBs bool, err error) {
 		nc.ach.close()
 	}
 	nc.mu.Unlock()
+
+	// Stop the fair dispatcher only on terminal close. Shutdown is
+	// deliberately non-blocking: a callback running on a dispatcher worker may
+	// itself call Close, and waiting synchronously would self-deadlock. The
+	// workers terminate on their own after every scheduled subscription
+	// reaches its one-time terminal cleanup; completion is observable via
+	// WaitForFairDispatchShutdown or the subscription closed handler. The
+	// dispatcher pointer is retained (rather than nilled) so the dispatcher's
+	// closed state and shutdown completion remain observable after Close.
+	if status == CLOSED && nc.fd != nil {
+		nc.fd.shutdown()
+	}
 }
 
 // Close will close the connection to the server. This call will release
@@ -6885,14 +7040,18 @@ func (nc *Conn) Barrier(f func()) error {
 		sub.mu.Lock()
 		if sub.mch == nil {
 			msg := &Msg{barrier: barrier}
-			// Push onto the async pList
-			if sub.pTail != nil {
+			if nc.fd != nil {
+				// Fair dispatch: queue the barrier marker and ensure a
+				// dispatcher turn so it is observed in FIFO order.
+				nc.fd.enqueueLocked(sub, msg)
+			} else if sub.pTail != nil {
 				sub.pTail.next = msg
+				sub.pTail = msg
 			} else {
 				sub.pHead = msg
+				sub.pTail = msg
 				sub.pCond.Signal()
 			}
-			sub.pTail = msg
 		}
 		sub.mu.Unlock()
 	}
