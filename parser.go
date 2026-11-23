@@ -15,6 +15,7 @@ package nats
 
 import (
 	"fmt"
+	"math"
 )
 
 type msgArg struct {
@@ -27,6 +28,28 @@ type msgArg struct {
 
 const MAX_CONTROL_LINE_SIZE = 4096
 
+const (
+	// maxControlLineArgSize bounds the argument portion of one control line.
+	// A peer that never terminates a line must not be able to grow argBuf
+	// without bound, and an unbounded line makes truncation indistinguishable
+	// from a slow writer.
+	maxControlLineArgSize = 64 * 1024
+
+	// maxMsgSize bounds a declared MSG/HMSG payload length. It is validated
+	// before any payload allocation, so a forged length can only fail the
+	// frame. It is deliberately above the largest payload a conformant server
+	// negotiates (MaxPayload, 64MiB).
+	maxMsgSize = 128 * 1024 * 1024
+
+	// maxParserErrorSnippet limits how much unparsed input a parse error
+	// quotes, so a bad frame can not turn into a huge error string.
+	maxParserErrorSnippet = 32
+)
+
+// parseState is the protocol parser state. Besides the state machine it keeps
+// the accounting needed to describe where a failure happened (current control
+// line, declared payload length and bytes consumed) and, once a frame fails,
+// the sticky terminal error.
 type parseState struct {
 	state     int
 	as        int
@@ -36,7 +59,43 @@ type parseState struct {
 	argBuf    []byte
 	msgBuf    []byte
 	msgCopied bool
-	scratch   [MAX_CONTROL_LINE_SIZE]byte
+
+	// lineLen is the number of argument bytes accumulated for the control
+	// line currently being parsed.
+	lineLen int
+	// payloadLen is the declared payload length of the current frame.
+	payloadLen int
+	// consumed is the number of bytes the parser has consumed since the
+	// generation was established. It stops advancing once err is set.
+	consumed int64
+
+	// err, when non-nil, is the sticky terminal error. The parser does not
+	// consume any more input until a new connection generation resets it.
+	err error
+	// gen is the connection generation this state belongs to.
+	gen uint64
+
+	scratch [MAX_CONTROL_LINE_SIZE]byte
+}
+
+// reset clears every residual byte and all frame accounting. It is used when
+// the parser is adopted by a new connection generation, and nowhere else.
+func (ps *parseState) reset() {
+	ps.state = OP_START
+	ps.as = 0
+	ps.drop = 0
+	ps.hdr = 0
+	ps.ma = msgArg{}
+	ps.argBuf = nil
+	ps.msgBuf = nil
+	ps.msgCopied = false
+	ps.lineLen = 0
+	ps.payloadLen = 0
+	ps.consumed = 0
+	ps.err = nil
+	// Drop any bytes left in the scratch buffer so they can not be mistaken
+	// for input belonging to the new generation.
+	clear(ps.scratch[:])
 }
 
 const (
@@ -57,6 +116,7 @@ const (
 	MSG_ARG
 	MSG_PAYLOAD
 	MSG_END
+	MSG_END_CR
 	OP_H
 	OP_P
 	OP_PI
@@ -73,8 +133,32 @@ const (
 	INFO_ARG
 )
 
+// parserFail records err as the sticky terminal state and returns it. Every
+// later parse call returns this exact error until the connection generation
+// changes.
+func (nc *Conn) parserFail(err error) error {
+	if nc.ps != nil {
+		nc.ps.err = err
+	}
+	return err
+}
+
 // parse is the fast protocol parser engine.
+//
+// A parse error is terminal for the current connection generation: the state
+// is not rewound and later calls return the same error without consuming
+// input. Complete messages parsed before the failing frame have already been
+// handed to processMsg; a partial frame is never delivered.
 func (nc *Conn) parse(buf []byte) error {
+	if nc.ps == nil {
+		nc.ps = &parseState{}
+	}
+	ps := nc.ps
+	// A terminal failure is sticky: do not guess at a boundary.
+	if ps.err != nil {
+		return ps.err
+	}
+
 	var i int
 	var b byte
 
@@ -82,53 +166,53 @@ func (nc *Conn) parse(buf []byte) error {
 	for i = 0; i < len(buf); i++ {
 		b = buf[i]
 
-		switch nc.ps.state {
+		switch ps.state {
 		case OP_START:
 			switch b {
 			case 'M', 'm':
-				nc.ps.state = OP_M
-				nc.ps.hdr = -1
-				nc.ps.ma.hdr = -1
+				ps.state = OP_M
+				ps.hdr = -1
+				ps.ma.hdr = -1
 			case 'H', 'h':
-				nc.ps.state = OP_H
-				nc.ps.hdr = 0
-				nc.ps.ma.hdr = 0
+				ps.state = OP_H
+				ps.hdr = 0
+				ps.ma.hdr = 0
 			case 'P', 'p':
-				nc.ps.state = OP_P
+				ps.state = OP_P
 			case '+':
-				nc.ps.state = OP_PLUS
+				ps.state = OP_PLUS
 			case '-':
-				nc.ps.state = OP_MINUS
+				ps.state = OP_MINUS
 			case 'I', 'i':
-				nc.ps.state = OP_I
+				ps.state = OP_I
 			default:
 				goto parseErr
 			}
 		case OP_H:
 			switch b {
 			case 'M', 'm':
-				nc.ps.state = OP_M
+				ps.state = OP_M
 			default:
 				goto parseErr
 			}
 		case OP_M:
 			switch b {
 			case 'S', 's':
-				nc.ps.state = OP_MS
+				ps.state = OP_MS
 			default:
 				goto parseErr
 			}
 		case OP_MS:
 			switch b {
 			case 'G', 'g':
-				nc.ps.state = OP_MSG
+				ps.state = OP_MSG
 			default:
 				goto parseErr
 			}
 		case OP_MSG:
 			switch b {
 			case ' ', '\t':
-				nc.ps.state = OP_MSG_SPC
+				ps.state = OP_MSG_SPC
 			default:
 				goto parseErr
 			}
@@ -136,42 +220,73 @@ func (nc *Conn) parse(buf []byte) error {
 			switch b {
 			case ' ', '\t':
 				continue
+			case '\r', '\n':
+				// The argument line ended before it began. Do not scan on:
+				// the next frame would be consumed as argument bytes.
+				ps.consumed += int64(i)
+				return nc.parserFail(fmt.Errorf("%w: empty message argument line", ErrParserProtocol))
 			default:
-				nc.ps.state = MSG_ARG
-				nc.ps.as = i
+				ps.state = MSG_ARG
+				ps.as = i
+				ps.lineLen = 0
 			}
 		case MSG_ARG:
 			switch b {
 			case '\r':
-				nc.ps.drop = 1
+				ps.drop = 1
 			case '\n':
-				var arg []byte
-				if nc.ps.argBuf != nil {
-					arg = nc.ps.argBuf
-				} else {
-					arg = buf[nc.ps.as : i-nc.ps.drop]
+				arg, err := msgArgBytes(ps, buf, i)
+				if err != nil {
+					ps.consumed += int64(i)
+					return nc.parserFail(err)
 				}
 				if err := nc.processMsgArgs(arg); err != nil {
-					return err
+					ps.consumed += int64(i)
+					return nc.parserFail(err)
 				}
-				nc.ps.drop, nc.ps.as, nc.ps.state = 0, i+1, MSG_PAYLOAD
+				ps.drop, ps.as, ps.state = 0, i+1, MSG_PAYLOAD
+				ps.payloadLen = ps.ma.size
+				ps.lineLen = 0
 
-				// jump ahead with the index. If this overruns
+				// Jump ahead with the index. If this overruns
 				// what is left we fall out and process a split buffer.
-				i = nc.ps.as + nc.ps.ma.size - 1
+				// A zero-size payload has no final byte, so enter the
+				// payload state at the terminator instead.
+				if ps.ma.size > 0 {
+					i = ps.as + ps.ma.size - 1
+				} else {
+					i = ps.as - 1
+				}
 			default:
-				if nc.ps.argBuf != nil {
-					nc.ps.argBuf = append(nc.ps.argBuf, b)
+				// A CR already ended the line; anything but LF after it is
+				// a protocol error, not an argument byte.
+				if ps.drop > 0 {
+					goto parseErr
+				}
+				if ps.argBuf != nil {
+					if len(ps.argBuf) >= maxControlLineArgSize {
+						ps.consumed += int64(i)
+						return nc.parserFail(fmt.Errorf("%w: %d bytes in control line",
+							ErrParserControlLineTooLong, len(ps.argBuf)))
+					}
+					ps.argBuf = append(ps.argBuf, b)
+					ps.lineLen = len(ps.argBuf)
 				}
 			}
 		case MSG_PAYLOAD:
-			if nc.ps.msgBuf != nil {
-				if len(nc.ps.msgBuf) >= nc.ps.ma.size {
-					nc.processMsg(nc.ps.msgBuf)
-					nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.state = nil, nil, false, MSG_END
+			if ps.msgBuf != nil {
+				if len(ps.msgBuf) >= ps.ma.size {
+					nc.processMsg(ps.msgBuf)
+					ps.argBuf, ps.msgBuf, ps.msgCopied = nil, nil, false
+					ps.lineLen = 0
+					// buf[i] is the first terminator byte. Reprocess it in
+					// MSG_END instead of skipping it: skipping it is what
+					// let a malformed terminator consume the next frame.
+					ps.state = MSG_END
+					i--
 				} else {
 					// copy as much as we can to the buffer and skip ahead.
-					toCopy := nc.ps.ma.size - len(nc.ps.msgBuf)
+					toCopy := ps.ma.size - len(ps.msgBuf)
 					avail := len(buf) - i
 
 					if avail < toCopy {
@@ -179,38 +294,56 @@ func (nc *Conn) parse(buf []byte) error {
 					}
 
 					if toCopy > 0 {
-						start := len(nc.ps.msgBuf)
+						start := len(ps.msgBuf)
 						// This is needed for copy to work.
-						nc.ps.msgBuf = nc.ps.msgBuf[:start+toCopy]
-						copy(nc.ps.msgBuf[start:], buf[i:i+toCopy])
+						ps.msgBuf = ps.msgBuf[:start+toCopy]
+						copy(ps.msgBuf[start:], buf[i:i+toCopy])
 						// Update our index
 						i = (i + toCopy) - 1
 					} else {
-						nc.ps.msgBuf = append(nc.ps.msgBuf, b)
+						ps.msgBuf = append(ps.msgBuf, b)
 					}
 				}
-			} else if i-nc.ps.as >= nc.ps.ma.size {
-				nc.processMsg(buf[nc.ps.as:i])
-				nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.state = nil, nil, false, MSG_END
+			} else if i-ps.as >= ps.ma.size {
+				// buf[as:i] is exactly the payload; buf[i] is the first
+				// terminator byte. Reprocess it in MSG_END so a bad
+				// terminator fails at the boundary instead of scanning
+				// into the following frame.
+				nc.processMsg(buf[ps.as:i])
+				ps.argBuf, ps.msgBuf, ps.msgCopied = nil, nil, false
+				ps.state = MSG_END
+				i--
 			}
 		case MSG_END:
 			switch b {
+			case '\r':
+				ps.state = MSG_END_CR
 			case '\n':
-				nc.ps.drop, nc.ps.as, nc.ps.state = 0, i+1, OP_START
+				// Historical tolerance for a lone LF terminator.
+				ps.finishFrame(i)
 			default:
-				continue
+				ps.consumed += int64(i)
+				return nc.parserFail(fmt.Errorf("%w: expected CRLF after payload, got %q",
+					ErrParserProtocol, b))
 			}
+		case MSG_END_CR:
+			if b != '\n' {
+				ps.consumed += int64(i)
+				return nc.parserFail(fmt.Errorf("%w: expected LF after CR, got %q",
+					ErrParserProtocol, b))
+			}
+			ps.finishFrame(i)
 		case OP_PLUS:
 			switch b {
 			case 'O', 'o':
-				nc.ps.state = OP_PLUS_O
+				ps.state = OP_PLUS_O
 			default:
 				goto parseErr
 			}
 		case OP_PLUS_O:
 			switch b {
 			case 'K', 'k':
-				nc.ps.state = OP_PLUS_OK
+				ps.state = OP_PLUS_OK
 			default:
 				goto parseErr
 			}
@@ -218,33 +351,33 @@ func (nc *Conn) parse(buf []byte) error {
 			switch b {
 			case '\n':
 				nc.processOK()
-				nc.ps.drop, nc.ps.state = 0, OP_START
+				ps.drop, ps.state = 0, OP_START
 			}
 		case OP_MINUS:
 			switch b {
 			case 'E', 'e':
-				nc.ps.state = OP_MINUS_E
+				ps.state = OP_MINUS_E
 			default:
 				goto parseErr
 			}
 		case OP_MINUS_E:
 			switch b {
 			case 'R', 'r':
-				nc.ps.state = OP_MINUS_ER
+				ps.state = OP_MINUS_ER
 			default:
 				goto parseErr
 			}
 		case OP_MINUS_ER:
 			switch b {
 			case 'R', 'r':
-				nc.ps.state = OP_MINUS_ERR
+				ps.state = OP_MINUS_ERR
 			default:
 				goto parseErr
 			}
 		case OP_MINUS_ERR:
 			switch b {
 			case ' ', '\t':
-				nc.ps.state = OP_MINUS_ERR_SPC
+				ps.state = OP_MINUS_ERR_SPC
 			default:
 				goto parseErr
 			}
@@ -253,48 +386,58 @@ func (nc *Conn) parse(buf []byte) error {
 			case ' ', '\t':
 				continue
 			default:
-				nc.ps.state = MINUS_ERR_ARG
-				nc.ps.as = i
+				ps.state = MINUS_ERR_ARG
+				ps.as = i
+				ps.lineLen = 0
 			}
 		case MINUS_ERR_ARG:
 			switch b {
 			case '\r':
-				nc.ps.drop = 1
+				ps.drop = 1
 			case '\n':
-				var arg []byte
-				if nc.ps.argBuf != nil {
-					arg = nc.ps.argBuf
-					nc.ps.argBuf = nil
-				} else {
-					arg = buf[nc.ps.as : i-nc.ps.drop]
+				arg, err := controlLineBytes(ps, buf, i)
+				if err != nil {
+					ps.consumed += int64(i)
+					return nc.parserFail(err)
 				}
+				ps.argBuf = nil
 				nc.processErr(string(arg))
-				nc.ps.drop, nc.ps.as, nc.ps.state = 0, i+1, OP_START
+				ps.drop, ps.as, ps.state = 0, i+1, OP_START
+				ps.lineLen = 0
 			default:
-				if nc.ps.argBuf != nil {
-					nc.ps.argBuf = append(nc.ps.argBuf, b)
+				if ps.drop > 0 {
+					goto parseErr
+				}
+				if ps.argBuf != nil {
+					if len(ps.argBuf) >= maxControlLineArgSize {
+						ps.consumed += int64(i)
+						return nc.parserFail(fmt.Errorf("%w: %d bytes in control line",
+							ErrParserControlLineTooLong, len(ps.argBuf)))
+					}
+					ps.argBuf = append(ps.argBuf, b)
+					ps.lineLen = len(ps.argBuf)
 				}
 			}
 		case OP_P:
 			switch b {
 			case 'I', 'i':
-				nc.ps.state = OP_PI
+				ps.state = OP_PI
 			case 'O', 'o':
-				nc.ps.state = OP_PO
+				ps.state = OP_PO
 			default:
 				goto parseErr
 			}
 		case OP_PO:
 			switch b {
 			case 'N', 'n':
-				nc.ps.state = OP_PON
+				ps.state = OP_PON
 			default:
 				goto parseErr
 			}
 		case OP_PON:
 			switch b {
 			case 'G', 'g':
-				nc.ps.state = OP_PONG
+				ps.state = OP_PONG
 			default:
 				goto parseErr
 			}
@@ -302,19 +445,19 @@ func (nc *Conn) parse(buf []byte) error {
 			switch b {
 			case '\n':
 				nc.processPong()
-				nc.ps.drop, nc.ps.state = 0, OP_START
+				ps.drop, ps.state = 0, OP_START
 			}
 		case OP_PI:
 			switch b {
 			case 'N', 'n':
-				nc.ps.state = OP_PIN
+				ps.state = OP_PIN
 			default:
 				goto parseErr
 			}
 		case OP_PIN:
 			switch b {
 			case 'G', 'g':
-				nc.ps.state = OP_PING
+				ps.state = OP_PING
 			default:
 				goto parseErr
 			}
@@ -322,33 +465,33 @@ func (nc *Conn) parse(buf []byte) error {
 			switch b {
 			case '\n':
 				nc.processPing()
-				nc.ps.drop, nc.ps.state = 0, OP_START
+				ps.drop, ps.state = 0, OP_START
 			}
 		case OP_I:
 			switch b {
 			case 'N', 'n':
-				nc.ps.state = OP_IN
+				ps.state = OP_IN
 			default:
 				goto parseErr
 			}
 		case OP_IN:
 			switch b {
 			case 'F', 'f':
-				nc.ps.state = OP_INF
+				ps.state = OP_INF
 			default:
 				goto parseErr
 			}
 		case OP_INF:
 			switch b {
 			case 'O', 'o':
-				nc.ps.state = OP_INFO
+				ps.state = OP_INFO
 			default:
 				goto parseErr
 			}
 		case OP_INFO:
 			switch b {
 			case ' ', '\t':
-				nc.ps.state = OP_INFO_SPC
+				ps.state = OP_INFO_SPC
 			default:
 				goto parseErr
 			}
@@ -357,26 +500,36 @@ func (nc *Conn) parse(buf []byte) error {
 			case ' ', '\t':
 				continue
 			default:
-				nc.ps.state = INFO_ARG
-				nc.ps.as = i
+				ps.state = INFO_ARG
+				ps.as = i
+				ps.lineLen = 0
 			}
 		case INFO_ARG:
 			switch b {
 			case '\r':
-				nc.ps.drop = 1
+				ps.drop = 1
 			case '\n':
-				var arg []byte
-				if nc.ps.argBuf != nil {
-					arg = nc.ps.argBuf
-					nc.ps.argBuf = nil
-				} else {
-					arg = buf[nc.ps.as : i-nc.ps.drop]
+				arg, err := controlLineBytes(ps, buf, i)
+				if err != nil {
+					ps.consumed += int64(i)
+					return nc.parserFail(err)
 				}
+				ps.argBuf = nil
 				nc.processAsyncInfo(arg)
-				nc.ps.drop, nc.ps.as, nc.ps.state = 0, i+1, OP_START
+				ps.drop, ps.as, ps.state = 0, i+1, OP_START
+				ps.lineLen = 0
 			default:
-				if nc.ps.argBuf != nil {
-					nc.ps.argBuf = append(nc.ps.argBuf, b)
+				if ps.drop > 0 {
+					goto parseErr
+				}
+				if ps.argBuf != nil {
+					if len(ps.argBuf) >= maxControlLineArgSize {
+						ps.consumed += int64(i)
+						return nc.parserFail(fmt.Errorf("%w: %d bytes in control line",
+							ErrParserControlLineTooLong, len(ps.argBuf)))
+					}
+					ps.argBuf = append(ps.argBuf, b)
+					ps.lineLen = len(ps.argBuf)
 				}
 			}
 		default:
@@ -384,37 +537,125 @@ func (nc *Conn) parse(buf []byte) error {
 		}
 	}
 	// Check for split buffer scenarios
-	if (nc.ps.state == MSG_ARG || nc.ps.state == MINUS_ERR_ARG || nc.ps.state == INFO_ARG) && nc.ps.argBuf == nil {
-		nc.ps.argBuf = nc.ps.scratch[:0]
-		nc.ps.argBuf = append(nc.ps.argBuf, buf[nc.ps.as:i-nc.ps.drop]...)
-		// FIXME, check max len
+	if (ps.state == MSG_ARG || ps.state == MINUS_ERR_ARG || ps.state == INFO_ARG) && ps.argBuf == nil {
+		// i is len(buf) here. A trailing CR (drop == 1) must be excluded
+		// from the captured argument bytes.
+		end := i - ps.drop
+		if end < ps.as {
+			end = ps.as
+		}
+		if end-ps.as > maxControlLineArgSize {
+			ps.consumed += int64(i)
+			return nc.parserFail(fmt.Errorf("%w: %d bytes in control line",
+				ErrParserControlLineTooLong, end-ps.as))
+		}
+		ps.argBuf = ps.scratch[:0]
+		ps.argBuf = append(ps.argBuf, buf[ps.as:end]...)
+		ps.lineLen = len(ps.argBuf)
 	}
 	// Check for split msg
-	if nc.ps.state == MSG_PAYLOAD && nc.ps.msgBuf == nil {
+	if ps.state == MSG_PAYLOAD && ps.msgBuf == nil {
 		// We need to clone the msgArg if it is still referencing the
 		// read buffer and we are not able to process the msg.
-		if nc.ps.argBuf == nil {
+		if ps.argBuf == nil {
 			nc.cloneMsgArg()
 		}
 
 		// If we will overflow the scratch buffer, just create a
 		// new buffer to hold the split message.
-		if nc.ps.ma.size > cap(nc.ps.scratch)-len(nc.ps.argBuf) {
-			lrem := len(buf[nc.ps.as:])
+		if ps.ma.size > cap(ps.scratch)-len(ps.argBuf) {
+			lrem := len(buf[ps.as:])
 
-			nc.ps.msgBuf = make([]byte, lrem, nc.ps.ma.size)
-			copy(nc.ps.msgBuf, buf[nc.ps.as:])
-			nc.ps.msgCopied = true
+			ps.msgBuf = make([]byte, lrem, ps.ma.size)
+			copy(ps.msgBuf, buf[ps.as:])
+			ps.msgCopied = true
 		} else {
-			nc.ps.msgBuf = nc.ps.scratch[len(nc.ps.argBuf):len(nc.ps.argBuf)]
-			nc.ps.msgBuf = append(nc.ps.msgBuf, (buf[nc.ps.as:])...)
+			ps.msgBuf = ps.scratch[len(ps.argBuf):len(ps.argBuf)]
+			ps.msgBuf = append(ps.msgBuf, (buf[ps.as:])...)
 		}
 	}
 
+	ps.consumed += int64(len(buf))
 	return nil
 
 parseErr:
-	return fmt.Errorf("nats: Parse Error [%d]: '%s'", nc.ps.state, buf[i:])
+	snippet := buf[i:]
+	if len(snippet) > maxParserErrorSnippet {
+		snippet = snippet[:maxParserErrorSnippet]
+	}
+	// The offending byte is not consumed, but everything before it was.
+	ps.consumed += int64(i)
+	return nc.parserFail(fmt.Errorf("%w [%d]: '%s'", ErrParserProtocol, ps.state, snippet))
+}
+
+// msgArgBytes returns the bytes of a MSG/HMSG argument line. It enforces the
+// control line bound and reports an empty line as a protocol error rather than
+// letting it fall through to the argument parser.
+func msgArgBytes(ps *parseState, buf []byte, i int) ([]byte, error) {
+	arg, err := controlLineBytes(ps, buf, i)
+	if err != nil {
+		return nil, err
+	}
+	if len(arg) == 0 {
+		return nil, fmt.Errorf("%w: empty message argument line", ErrParserProtocol)
+	}
+	return arg, nil
+}
+
+// controlLineBytes returns the payload argument of a control line ending at i.
+// It uses the accumulated argument buffer when the line was split across
+// reads, and otherwise slices the input. A trailing CR (drop == 1) is always
+// excluded.
+func controlLineBytes(ps *parseState, buf []byte, i int) ([]byte, error) {
+	if ps.argBuf != nil {
+		return ps.argBuf, nil
+	}
+	end := i - ps.drop
+	if end < ps.as {
+		end = ps.as
+	}
+	if end-ps.as > maxControlLineArgSize {
+		return nil, fmt.Errorf("%w: %d bytes in control line",
+			ErrParserControlLineTooLong, end-ps.as)
+	}
+	ps.lineLen = end - ps.as
+	return buf[ps.as:end], nil
+}
+
+// finishFrame consumes the frame terminator and returns to OP_START.
+func (ps *parseState) finishFrame(i int) {
+	ps.drop, ps.as, ps.state = 0, i+1, OP_START
+	ps.lineLen, ps.payloadLen = 0, 0
+}
+
+// parserInputError classifies a read error against the frame boundary. A read
+// error while the parser is between frames is passed through unchanged; one
+// observed in the middle of a frame means the frame was truncated, so it enters
+// the same sticky terminal state as a protocol error.
+func (nc *Conn) parserInputError(readErr error) error {
+	if nc.ps == nil {
+		return readErr
+	}
+	if nc.ps.err != nil {
+		return nc.ps.err
+	}
+	if nc.ps.state != OP_START {
+		return nc.parserFail(fmt.Errorf("%w: %v", ErrParserTruncated, readErr))
+	}
+	return readErr
+}
+
+// resetParserLocked establishes a new parser generation, clearing every
+// residual buffer byte and any sticky error. The connection lock must be held.
+// It is the only way the parser is reset.
+func (nc *Conn) resetParserLocked() {
+	nc.parserGen++
+	if nc.ps == nil {
+		nc.ps = &parseState{}
+	} else {
+		nc.ps.reset()
+	}
+	nc.ps.gen = nc.parserGen
 }
 
 // cloneMsgArg is used when the split buffer scenario has the pubArg in the existing read buffer, but
@@ -464,20 +705,36 @@ func (nc *Conn) processMsgArgs(arg []byte) error {
 		nc.ps.ma.subject = args[0]
 		nc.ps.ma.sid = parseInt64(args[1])
 		nc.ps.ma.reply = nil
-		nc.ps.ma.size = int(parseInt64(args[2]))
+		size := parseInt64(args[2])
+		if err := validateMsgSize(size, arg); err != nil {
+			return err
+		}
+		nc.ps.ma.size = int(size)
 	case 4:
 		nc.ps.ma.subject = args[0]
 		nc.ps.ma.sid = parseInt64(args[1])
 		nc.ps.ma.reply = args[2]
-		nc.ps.ma.size = int(parseInt64(args[3]))
+		size := parseInt64(args[3])
+		if err := validateMsgSize(size, arg); err != nil {
+			return err
+		}
+		nc.ps.ma.size = int(size)
 	default:
-		return fmt.Errorf("nats: processMsgArgs Parse Error: '%s'", arg)
+		return fmt.Errorf("%w: processMsgArgs Parse Error: '%s'", ErrParserProtocol, snippet(arg))
 	}
 	if nc.ps.ma.sid < 0 {
-		return fmt.Errorf("nats: processMsgArgs Bad or Missing Sid: '%s'", arg)
+		return fmt.Errorf("%w: processMsgArgs Bad or Missing Sid: '%s'", ErrParserProtocol, snippet(arg))
 	}
-	if nc.ps.ma.size < 0 {
-		return fmt.Errorf("nats: processMsgArgs Bad or Missing Size: '%s'", arg)
+	return nil
+}
+
+// validateMsgSize rejects missing, negative or implausibly large length fields
+// before any payload memory is allocated. It takes the untruncated int64 value
+// so an over-large field is caught even on 32-bit platforms, where converting
+// it to int could otherwise wrap into a small or negative number.
+func validateMsgSize(size int64, arg []byte) error {
+	if size < 0 || size > maxMsgSize {
+		return fmt.Errorf("%w: processMsgArgs Bad or Missing Size: '%s'", ErrParserBadLength, snippet(arg))
 	}
 	return nil
 }
@@ -510,27 +767,47 @@ func (nc *Conn) processHeaderMsgArgs(arg []byte) error {
 		nc.ps.ma.subject = args[0]
 		nc.ps.ma.sid = parseInt64(args[1])
 		nc.ps.ma.reply = nil
-		nc.ps.ma.hdr = int(parseInt64(args[2]))
-		nc.ps.ma.size = int(parseInt64(args[3]))
+		hdr := parseInt64(args[2])
+		size := parseInt64(args[3])
+		if err := validateMsgSize(size, arg); err != nil {
+			return err
+		}
+		if hdr < 0 || hdr > size {
+			return fmt.Errorf("%w: processHeaderMsgArgs Bad or Missing Header Size: '%s'",
+				ErrParserBadLength, snippet(arg))
+		}
+		nc.ps.ma.hdr = int(hdr)
+		nc.ps.ma.size = int(size)
 	case 5:
 		nc.ps.ma.subject = args[0]
 		nc.ps.ma.sid = parseInt64(args[1])
 		nc.ps.ma.reply = args[2]
-		nc.ps.ma.hdr = int(parseInt64(args[3]))
-		nc.ps.ma.size = int(parseInt64(args[4]))
+		hdr := parseInt64(args[3])
+		size := parseInt64(args[4])
+		if err := validateMsgSize(size, arg); err != nil {
+			return err
+		}
+		if hdr < 0 || hdr > size {
+			return fmt.Errorf("%w: processHeaderMsgArgs Bad or Missing Header Size: '%s'",
+				ErrParserBadLength, snippet(arg))
+		}
+		nc.ps.ma.hdr = int(hdr)
+		nc.ps.ma.size = int(size)
 	default:
-		return fmt.Errorf("nats: processHeaderMsgArgs Parse Error: '%s'", arg)
+		return fmt.Errorf("%w: processHeaderMsgArgs Parse Error: '%s'", ErrParserProtocol, snippet(arg))
 	}
 	if nc.ps.ma.sid < 0 {
-		return fmt.Errorf("nats: processHeaderMsgArgs Bad or Missing Sid: '%s'", arg)
-	}
-	if nc.ps.ma.hdr < 0 || nc.ps.ma.hdr > nc.ps.ma.size {
-		return fmt.Errorf("nats: processHeaderMsgArgs Bad or Missing Header Size: '%s'", arg)
-	}
-	if nc.ps.ma.size < 0 {
-		return fmt.Errorf("nats: processHeaderMsgArgs Bad or Missing Size: '%s'", arg)
+		return fmt.Errorf("%w: processHeaderMsgArgs Bad or Missing Sid: '%s'", ErrParserProtocol, snippet(arg))
 	}
 	return nil
+}
+
+// snippet bounds an argument echoed in an error message.
+func snippet(b []byte) string {
+	if len(b) > maxParserErrorSnippet {
+		b = b[:maxParserErrorSnippet]
+	}
+	return string(b)
 }
 
 // ASCII numbers 0-9
@@ -539,8 +816,9 @@ const (
 	ascii_9 = 57
 )
 
-// parseInt64 expects decimal positive numbers. We
-// return -1 to signal error
+// parseInt64 expects decimal positive numbers. We return -1 to signal error,
+// including empty input, non-digit characters and int64 overflow. Overflow
+// must be detected here rather than left to wrap into an accepted value.
 func parseInt64(d []byte) (n int64) {
 	if len(d) == 0 {
 		return -1
@@ -549,7 +827,11 @@ func parseInt64(d []byte) (n int64) {
 		if dec < ascii_0 || dec > ascii_9 {
 			return -1
 		}
-		n = n*10 + (int64(dec) - ascii_0)
+		digit := int64(dec - ascii_0)
+		if n > (math.MaxInt64-digit)/10 {
+			return -1
+		}
+		n = n*10 + digit
 	}
 	return n
 }

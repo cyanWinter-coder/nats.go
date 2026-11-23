@@ -167,6 +167,29 @@ var (
 	ErrMixingWebsocketSchemes        = errors.New("nats: mixing of websocket and non websocket URLs is not allowed")
 )
 
+// Parser errors. A protocol frame that can not be parsed puts the parser in a
+// sticky terminal state: no later input is consumed and the same error is
+// reported until a new connection generation resets the parser. Complete
+// messages delivered before the failing frame are unaffected; a partial frame
+// is never delivered.
+var (
+	// ErrParserProtocol reports a frame whose opcode, framing, argument list
+	// or terminator the client does not recognize.
+	ErrParserProtocol = errors.New("nats: protocol parsing error")
+
+	// ErrParserTruncated reports input that ended in the middle of a frame,
+	// for example a payload shorter than the length its control line declared.
+	ErrParserTruncated = errors.New("nats: truncated protocol frame")
+
+	// ErrParserBadLength reports a missing, non-numeric, negative, overflowing
+	// or implausibly large length field.
+	ErrParserBadLength = errors.New("nats: invalid protocol length")
+
+	// ErrParserControlLineTooLong reports a control line that grew past the
+	// parser's limit before a terminator was seen.
+	ErrParserControlLineTooLong = errors.New("nats: control line exceeds maximum size")
+)
+
 // GetDefaultOptions returns default configuration options for the client.
 func GetDefaultOptions() Options {
 	return Options{
@@ -696,12 +719,16 @@ type Conn struct {
 	initc         bool // true if the connection is performing the initial connect
 	err           error
 	ps            *parseState
-	ptmr          *time.Timer
-	pout          int
-	ar            bool // abort reconnect
-	rqch          chan struct{}
-	ws            bool // true if a websocket connection
-	awaitInfo     bool // wait for the INFO after the first PONG before connected
+	// parserGen is the connection generation the parser belongs to. It is
+	// advanced only when the parser is reset for a new connection, never to
+	// recover from a parse error.
+	parserGen uint64
+	ptmr      *time.Timer
+	pout      int
+	ar        bool // abort reconnect
+	rqch      chan struct{}
+	ws        bool // true if a websocket connection
+	awaitInfo bool // wait for the INFO after the first PONG before connected
 	// tlsReason says what made the client ask for TLS.
 	tlsReason string
 
@@ -3910,11 +3937,11 @@ func (nc *Conn) readLoop() {
 	// Release the wait group on exit
 	defer nc.wg.Done()
 
-	// Create a parseState if needed.
+	// Create a parseState if needed. A readLoop runs per connection, so it
+	// owns a parser generation: adopting the parser here clears any frames,
+	// buffers and sticky error left by a previous connection.
 	nc.mu.Lock()
-	if nc.ps == nil {
-		nc.ps = &parseState{}
-	}
+	nc.resetParserLocked()
 	conn := nc.conn
 	br := nc.br
 	nc.mu.Unlock()
@@ -3934,6 +3961,12 @@ func (nc *Conn) readLoop() {
 				continue
 			}
 			err = nc.parse(buf)
+		} else {
+			// A read error observed mid-frame means the frame was cut off.
+			// Classify it before the connection is torn down so callers see
+			// a truncation rather than a generic read error, but leave a
+			// clean boundary untouched.
+			err = nc.parserInputError(err)
 		}
 		if err != nil {
 			// Report the write error rather than the read error it caused.
